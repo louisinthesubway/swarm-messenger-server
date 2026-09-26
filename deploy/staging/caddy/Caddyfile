@@ -1,0 +1,96 @@
+# SWARM Messenger — staging TLS edge.
+#
+# Start with:  docker compose --profile edge up -d caddy
+#
+# Caddy gets certificates for the three public names from Let's Encrypt automatically, which
+# requires ports 80 and 443 reachable from the internet and the A/AAAA records already
+# pointing at this host. See docs/STAGING.md ("DNS") before starting it.
+#
+# The chat server speaks cleartext HTTP/2 (h2c) on 8080 inside the compose network, so every
+# route below uses `transport http { versions h2c 2 }`.
+#
+# The alternative is to skip Caddy entirely and let the JVM terminate TLS: replace the `h2c`
+# application connector in staging.yml with an `h2` connector and point tlsKeyStore at a
+# PKCS#12 keystore. Caddy is the default because renewals are then somebody else's problem.
+
+{
+	email {$SWARM_ACME_EMAIL}
+	# Uncomment while testing DNS or rate limits, then comment it out again — a staging
+	# certificate is not trusted by clients.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+# ------------------------------------------------------------------ chat API + websocket
+{$SWARM_CHAT_DOMAIN} {
+	encode zstd gzip
+
+	# The websocket endpoints clients use to send and receive messages.
+	@websocket path /v1/websocket /v1/websocket/*
+	handle @websocket {
+		reverse_proxy chat:8080 {
+			transport http {
+				versions h2c 2
+			}
+			# Message delivery holds the socket open indefinitely.
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy chat:8080 {
+			transport http {
+				versions h2c 2
+			}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# The Dropwizard admin connector carries health checks and metrics. It is NOT published.
+	@admin path /healthcheck /metrics /metrics/*
+	handle @admin {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# ------------------------------------------------------------------ attachments / CDN
+# Objects live in MinIO. Requests are rewritten to the bucket so clients never see the
+# bucket name, and only reads are allowed through the edge: uploads go through the chat
+# server's signed-URL flow.
+{$SWARM_CDN_DOMAIN} {
+	encode zstd gzip
+
+	@readonly method GET HEAD
+	handle @readonly {
+		rewrite * /swarm-cdn{uri}
+		reverse_proxy minio:9000
+	}
+
+	handle {
+		respond "method not allowed" 405
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# ------------------------------------------------------------------ registration
+# reg.chat.swarm.green is deliberately NOT proxied to the registration stub. The stub speaks
+# gRPC over its own TLS with a private CA and is reachable only from the chat container on the
+# compose network. Publishing it would expose a service that accepts one fixed code for every
+# phone number. The name is answered so that a misconfigured client fails loudly.
+{$SWARM_REG_DOMAIN:reg.chat.swarm.green} {
+	respond "SWARM Messenger staging: the registration service is not published. Clients register through {$SWARM_CHAT_DOMAIN}." 404
+
+	log {
+		output stdout
+		format console
+	}
+}
