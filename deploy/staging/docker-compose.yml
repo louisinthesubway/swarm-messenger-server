@@ -1,0 +1,385 @@
+# SWARM Messenger — staging stack (self-hosted, single Linux host)
+#
+# Every cloud dependency of upstream Signal-Server is replaced with a local equivalent:
+#
+#   FoundationDB   messages          foundationdb/foundationdb (single, ssd)
+#   DynamoDB       accounts/keys/... amazon/dynamodb-local
+#   Redis clusters cache/rate/...    bitnamilegacy/redis-cluster (one single-node cluster per role)
+#   Redis          pubsub            redis (standalone)
+#   S3             CDN + paged PQ    minio
+#   Registration   SMS verification  ./registration-stub (fixed code, staging only)
+#   TLS            public edge       caddy (profile: edge)
+#
+# Container images are pinned to the same tags/digests the upstream test suite uses
+# (see pom.xml: dynamodb.image, redis.image, redis-cluster.image, foundationdb.version).
+#
+# Nothing here talks to Signal's servers, to AWS, to GCP, or to any push service.
+#
+# Start order and health checks: docs/STAGING.md
+# What is disabled and why:      docs/STAGING.md ("Disabled features")
+# Deviations from upstream code: docs/SWARM-CHANGES.md
+
+name: swarm-messenger-staging
+
+x-restart: &restart
+  restart: unless-stopped
+
+networks:
+  swarm:
+    name: swarm-staging
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+
+volumes:
+  fdb-data:
+  fdb-etc:
+  dynamodb-data:
+  minio-data:
+  caddy-data:
+  caddy-config:
+  redis-cache-data:
+  redis-pushscheduler-data:
+  redis-ratelimiters-data:
+  redis-messages-data:
+
+services:
+
+  # ---------------------------------------------------------------- FoundationDB
+  # Message store. Single-process, ssd redundancy: correct for staging, NOT for production
+  # (production wants at least "double" redundancy across three machines).
+  foundationdb:
+    <<: *restart
+    image: foundationdb/foundationdb:7.3.76
+    hostname: foundationdb
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_CLUSTER_FILE: /var/fdb/etc/fdb.cluster
+      FDB_COORDINATOR_PORT: "4500"
+    volumes:
+      - fdb-data:/var/fdb/data
+      - fdb-etc:/var/fdb/etc
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.11
+    healthcheck:
+      # "fdbcli --exec status" exits non-zero while the database is unavailable.
+      test: ["CMD-SHELL", "fdbcli --exec 'status minimal' | grep -q 'The database is available'"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+
+  # One-shot: creates the database the first time the volume is empty. Idempotent —
+  # "configure new" fails harmlessly once a database exists.
+  foundationdb-init:
+    image: foundationdb/foundationdb:7.3.76
+    restart: "no"
+    depends_on:
+      foundationdb:
+        condition: service_started
+    environment:
+      FDB_CLUSTER_FILE: /var/fdb/etc/fdb.cluster
+    volumes:
+      - fdb-etc:/var/fdb/etc
+      - ./foundationdb/init-foundationdb.sh:/init-foundationdb.sh:ro
+    entrypoint: ["/bin/bash", "/init-foundationdb.sh"]
+    networks:
+      - swarm
+
+  # ---------------------------------------------------------------- DynamoDB Local
+  dynamodb:
+    <<: *restart
+    image: amazon/dynamodb-local:3.3.1@sha256:ff89bd48ff32cd8d9be5fee8873b65b8854dc408f1afe881be6eb00247bc0dab
+    hostname: dynamodb
+    user: root
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-disableTelemetry", "-dbPath", "/data"]
+    volumes:
+      - dynamodb-data:/data
+    networks:
+      - swarm
+    healthcheck:
+      # DynamoDB Local answers 400 to an unsigned GET; any HTTP answer means it is up.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8000 && echo -e 'GET / HTTP/1.0\\n\\n' >&3 && head -c 12 <&3 | grep -q HTTP"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: creates every table named in staging.yml. Idempotent.
+  dynamodb-bootstrap:
+    image: amazon/aws-cli:2.31.11
+    restart: "no"
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${SWARM_AWS_ACCESS_KEY_ID:-swarmstaging}
+      AWS_SECRET_ACCESS_KEY: ${SWARM_AWS_SECRET_ACCESS_KEY:-swarmstaging}
+      AWS_DEFAULT_REGION: ${SWARM_AWS_REGION:-us-east-1}
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      SWARM_TABLE_PREFIX: ${SWARM_TABLE_PREFIX:-swarm_}
+    volumes:
+      - ./dynamodb/bootstrap-tables.sh:/bootstrap-tables.sh:ro
+    entrypoint: ["/bin/bash", "/bootstrap-tables.sh"]
+    networks:
+      - swarm
+
+  # ---------------------------------------------------------------- Redis
+  # Four Redis *clusters*, one per role, because FaultTolerantRedisClusterClient speaks
+  # the cluster protocol (CLUSTER SLOTS / MOVED) and will not talk to a standalone server.
+  # Each is a single-node cluster owning all 16384 slots — the smallest thing that is still
+  # a real cluster. Static IPs are used because a Redis cluster announces the address it
+  # believes it has, and the chat server connects to whatever it announces.
+  redis-cache:
+    <<: *restart
+    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    hostname: redis-cache
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+      REDIS_CLUSTER_REPLICAS: "0"
+      REDIS_NODES: "10.77.0.21"
+      REDIS_CLUSTER_CREATOR: "yes"
+      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.21"
+    volumes:
+      - redis-cache-data:/bitnami/redis/data
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.21
+    healthcheck: &redis-cluster-health
+      test: ["CMD-SHELL", "redis-cli cluster info | grep -q 'cluster_state:ok'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+  redis-pushscheduler:
+    <<: *restart
+    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    hostname: redis-pushscheduler
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+      REDIS_CLUSTER_REPLICAS: "0"
+      REDIS_NODES: "10.77.0.22"
+      REDIS_CLUSTER_CREATOR: "yes"
+      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.22"
+    volumes:
+      - redis-pushscheduler-data:/bitnami/redis/data
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.22
+    healthcheck: *redis-cluster-health
+
+  redis-ratelimiters:
+    <<: *restart
+    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    hostname: redis-ratelimiters
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+      REDIS_CLUSTER_REPLICAS: "0"
+      REDIS_NODES: "10.77.0.23"
+      REDIS_CLUSTER_CREATOR: "yes"
+      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.23"
+    volumes:
+      - redis-ratelimiters-data:/bitnami/redis/data
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.23
+    healthcheck: *redis-cluster-health
+
+  # Message cache. Holds undelivered messages until they are persisted to FoundationDB,
+  # so it is the one Redis whose loss costs undelivered traffic.
+  redis-messages:
+    <<: *restart
+    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    hostname: redis-messages
+    environment:
+      ALLOW_EMPTY_PASSWORD: "yes"
+      REDIS_CLUSTER_REPLICAS: "0"
+      REDIS_NODES: "10.77.0.24"
+      REDIS_CLUSTER_CREATOR: "yes"
+      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.24"
+    volumes:
+      - redis-messages-data:/bitnami/redis/data
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.24
+    healthcheck: *redis-cluster-health
+
+  # Standalone (non-cluster) Redis: the `pubsub` block is a FaultTolerantRedisClient,
+  # not a cluster client.
+  redis-pubsub:
+    <<: *restart
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    hostname: redis-pubsub
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.25
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------- MinIO (S3)
+  # MINIO_DOMAIN makes MinIO accept virtual-host-style addressing, which is what the AWS
+  # SDK v2 uses by default. The network aliases below make <bucket>.minio.swarm.local
+  # resolve to this container, so no code change is needed to force path-style addressing.
+  minio:
+    <<: *restart
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    hostname: minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${SWARM_MINIO_ROOT_USER:-swarmstaging}
+      MINIO_ROOT_PASSWORD: ${SWARM_MINIO_ROOT_PASSWORD:?set SWARM_MINIO_ROOT_PASSWORD in .env}
+      MINIO_DOMAIN: minio.swarm.local
+    volumes:
+      - minio-data:/data
+    networks:
+      swarm:
+        aliases:
+          - minio.swarm.local
+          - swarm-cdn.minio.swarm.local
+          - swarm-prekeys.minio.swarm.local
+          - swarm-config.minio.swarm.local
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  minio-bootstrap:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${SWARM_MINIO_ROOT_USER:-swarmstaging}
+      MINIO_ROOT_PASSWORD: ${SWARM_MINIO_ROOT_PASSWORD:?set SWARM_MINIO_ROOT_PASSWORD in .env}
+      SWARM_CDN_ACCESS_KEY: ${SWARM_CDN_ACCESS_KEY:-swarmcdn}
+      SWARM_CDN_SECRET_KEY: ${SWARM_CDN_SECRET_KEY:?set SWARM_CDN_SECRET_KEY in .env}
+    volumes:
+      - ./minio/bootstrap-buckets.sh:/bootstrap-buckets.sh:ro
+      - ./minio/dynamic-config.yaml:/in/dynamic-config.yaml:ro
+      - ./minio/asn.tsv:/in/asn.tsv:ro
+    entrypoint: ["/bin/sh", "/bootstrap-buckets.sh"]
+    networks:
+      - swarm
+
+  # ---------------------------------------------------------------- registration stub
+  # Issues and accepts one fixed verification code. Refuses to start unless
+  # SWARM_STAGING_FIXED_CODE=true. Never deploy this on a public registration endpoint.
+  registration-stub:
+    <<: *restart
+    build:
+      context: ./registration-stub
+      args:
+        REGISTRATION_PROTO: RegistrationService.proto
+    image: swarm-messenger/registration-stub:staging
+    hostname: registration-stub
+    environment:
+      SWARM_STAGING_FIXED_CODE: ${SWARM_STAGING_FIXED_CODE:?must be exactly "true" to run the staging stack}
+      SWARM_STAGING_VERIFICATION_CODE: ${SWARM_STAGING_VERIFICATION_CODE:-123456}
+      SWARM_STUB_LISTEN: "0.0.0.0:8443"
+      SWARM_STUB_TLS_CERT: /certs/registration-stub.crt
+      SWARM_STUB_TLS_KEY: /certs/registration-stub.key
+    volumes:
+      - ./certs:/certs:ro
+    networks:
+      - swarm
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ---------------------------------------------------------------- chat server
+  chat:
+    <<: *restart
+    build:
+      context: ../..
+      dockerfile: deploy/staging/Dockerfile
+    image: swarm-messenger/chat:staging
+    hostname: chat
+    depends_on:
+      foundationdb:
+        condition: service_healthy
+      foundationdb-init:
+        condition: service_completed_successfully
+      dynamodb:
+        condition: service_healthy
+      dynamodb-bootstrap:
+        condition: service_completed_successfully
+      minio-bootstrap:
+        condition: service_completed_successfully
+      redis-cache:
+        condition: service_healthy
+      redis-pushscheduler:
+        condition: service_healthy
+      redis-ratelimiters:
+        condition: service_healthy
+      redis-messages:
+        condition: service_healthy
+      redis-pubsub:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      registration-stub:
+        condition: service_started
+    environment:
+      # The staging registration channel carries no identity token; the server refuses to
+      # start with `registrationService.type: swarm-staging` unless this is exactly "true".
+      SWARM_STAGING_FIXED_CODE: ${SWARM_STAGING_FIXED_CODE:?must be exactly "true" to run the staging stack}
+      SECRETS_BUNDLE: /config/staging-secrets.yml
+      JAVA_TOOL_OPTIONS: >-
+        -XX:MaxRAMPercentage=60
+        -XX:+HeapDumpOnOutOfMemoryError
+        -XX:HeapDumpPath=/tmp/heapdump.bin
+        -Djava.awt.headless=true
+        -Dlog4j2.formatMsgNoLookups=true
+    volumes:
+      - ./staging.yml:/config/staging.yml:ro
+      - ./staging-secrets.yml:/config/staging-secrets.yml:ro
+      - fdb-etc:/etc/foundationdb:ro
+    ports:
+      # Bound to loopback only. Public traffic arrives through caddy.
+      - "127.0.0.1:8080:8080"   # HTTP/2 cleartext REST + websocket
+      - "127.0.0.1:8081:8081"   # Dropwizard admin (health, metrics)
+      - "127.0.0.1:50051:50051" # gRPC "omnibus" listener
+    networks:
+      - swarm
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /healthcheck HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+  # ---------------------------------------------------------------- TLS edge
+  # Optional: `docker compose --profile edge up -d`. Terminates TLS for
+  # chat.swarm.green / cdn.chat.swarm.green / reg.chat.swarm.green.
+  caddy:
+    <<: *restart
+    profiles: ["edge"]
+    image: caddy:2.10-alpine
+    hostname: caddy
+    depends_on:
+      chat:
+        condition: service_started
+    environment:
+      SWARM_CHAT_DOMAIN: ${SWARM_CHAT_DOMAIN:-chat.swarm.green}
+      SWARM_CDN_DOMAIN: ${SWARM_CDN_DOMAIN:-cdn.chat.swarm.green}
+      SWARM_ACME_EMAIL: ${SWARM_ACME_EMAIL:?set SWARM_ACME_EMAIL in .env}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    networks:
+      - swarm

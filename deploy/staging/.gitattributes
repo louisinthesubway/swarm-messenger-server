@@ -1,0 +1,11 @@
+# These files are mounted into Linux containers and run by /bin/sh or /bin/bash. A CRLF line
+# ending makes the shebang line fail with "no such file or directory", which is one of the
+# least helpful error messages there is. Force LF no matter what the checkout platform does.
+*.sh            text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.tsv           text eol=lf
+Dockerfile      text eol=lf
+Caddyfile       text eol=lf
+.env.example    text eol=lf

@@ -1,0 +1,14 @@
+# SWARM Messenger staging — never commit the filled-in versions of these.
+#
+# Committed: *.example templates, the compose file, the scripts, staging.yml.
+# Generated on the host by generate-secrets.sh and certs/make-certs.sh: everything below.
+
+.env
+staging-secrets.yml
+
+certs/*.key
+certs/*.crt
+certs/*.csr
+certs/*.srl
+certs/*.ext
+certs/*.pem

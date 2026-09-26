@@ -1,0 +1,595 @@
+# SWARM Messenger — staging configuration for the self-hosted stack in this directory.
+#
+# Read docs/STAGING.md before changing anything here.
+#
+# HOW THIS FILE WAS DERIVED
+# -----------------------------------------------------------------------------------------
+# It starts from upstream's own `service/src/test/resources/config/test.yml`, which is the
+# configuration upstream uses to boot a real, feature-limited server
+# (`./mvnw integration-test -Ptest-server`). Every block for a feature SWARM does not run —
+# billing, push, SVR, CDSI, key transparency — keeps upstream's placeholder values verbatim,
+# because upstream demonstrably starts a server with them.
+#
+# Only the blocks that must point at something real were changed:
+#
+#   dynamoDbClient                 -> DynamoDB Local (endpointOverride; see docs/SWARM-CHANGES.md)
+#   dynamoDbTables                 -> swarm_* table names created by dynamodb/bootstrap-tables.sh
+#   cacheCluster / pushScheduler /
+#     rateLimiters / messageCache  -> the four single-node Redis clusters in docker-compose.yml
+#   pubsub                         -> the standalone Redis in docker-compose.yml
+#   foundationDbMessages.clusters  -> the cluster file written by the foundationdb container
+#   cdn / pagedSingleUseKEMPreKey  -> MinIO
+#   dynamicConfig / asnTable       -> objects in MinIO (uploaded by minio/bootstrap-buckets.sh)
+#   registrationService            -> the fixed-code stub in registration-stub/
+#   server / grpc / externalRequestFilter -> listen addresses for a container
+#
+# Environment variables are substituted before the YAML is parsed (Dropwizard
+# SubstitutingSourceProvider, strict mode), so `${VAR:-default}` works and a `${VAR}` with no
+# default makes the server refuse to start. Secrets are NOT in this file; they are resolved
+# through `secret://` from the bundle named by -Dsecrets.bundle.filename.
+
+logging:
+  level: ${SWARM_LOG_LEVEL:-INFO}
+  loggers:
+    org.whispersystems.textsecuregcm: ${SWARM_LOG_LEVEL:-INFO}
+  appenders:
+    - type: console
+      threshold: ALL
+      timeZone: UTC
+      target: stdout
+
+health:
+  # Staging restarts often; do not hold the port open draining connections.
+  delayedShutdownHandlerEnabled: false
+
+server:
+  allowedMethods:
+    - GET
+    - POST
+    - PUT
+    - DELETE
+    - HEAD
+    - OPTIONS
+    - PATCH
+    - CONNECT
+  applicationConnectors:
+    # Cleartext HTTP/2 (h2c). TLS is terminated by Caddy at the edge; see caddy/Caddyfile.
+    # If you would rather have the server terminate TLS itself, replace this with a
+    # `type: h2` connector plus keyStorePath/keyStorePassword and set tlsKeyStore below.
+    - type: h2c
+      port: 8080
+      useForwardedHeaders: true
+  adminConnectors:
+    - type: http
+      port: 8081
+      bindHost: 0.0.0.0
+
+grpc:
+  bindAddress: 0.0.0.0
+  port: 50051
+  websocketAddress: localhost
+  websocketPort: 8080
+  h2c: true
+
+# Only a path-less keystore: nothing in this stack terminates TLS inside the JVM.
+tlsKeyStore:
+  password: secret://tlsKeyStore.password
+
+externalRequestFilter:
+  grpcMethods: []
+  paths: []
+  permittedInternalRanges:
+    - 127.0.0.0/8
+    # The compose network, so the admin/metrics paths stay reachable from sibling containers.
+    - 10.77.0.0/24
+
+# ---------------------------------------------------------------------------- storage
+
+awsCredentialsProvider:
+  type: static
+  accessKeyId: secret://aws.accessKeyId
+  secretAccessKey: secret://aws.secretAccessKey
+
+dynamoDbClient:
+  # SWARM: endpointOverride is a SWARM addition to DynamoDbClientConfiguration. See
+  # docs/SWARM-CHANGES.md. With it unset the behaviour is exactly upstream's.
+  region: ${SWARM_AWS_REGION:-us-east-1}
+  endpointOverride: ${SWARM_DYNAMODB_ENDPOINT:-http://dynamodb:8000}
+  clientExecutionTimeout: PT30S
+  clientRequestTimeout: PT10S
+  maxConnections: 50
+
+dynamoDbTables:
+  accounts:
+    tableName: swarm_accounts
+    phoneNumberTableName: swarm_numbers
+    phoneNumberIdentifierTableName: swarm_pni_assignment
+    usernamesTableName: swarm_usernames
+    usedLinkDeviceTokensTableName: swarm_used_link_device_tokens
+  appleDeviceChecks:
+    tableName: swarm_apple_device_check
+  appleDeviceCheckPublicKeys:
+    tableName: swarm_apple_device_check_key_constraint
+  backups:
+    tableName: swarm_backups
+  changeNumberWaitingPeriods:
+    tableName: swarm_change_number_waiting_periods
+  clientReleases:
+    tableName: swarm_client_releases
+  deletedAccounts:
+    tableName: swarm_deleted_accounts
+  deletedAccountsLock:
+    tableName: swarm_deleted_accounts_lock
+  donationPermits:
+    tableName: swarm_donation_permits
+    expiration: P7D
+  issuedReceipts:
+    tableName: swarm_issued_receipts
+    generator: ${SWARM_ISSUED_RECEIPTS_GENERATOR:-abcdefg12345678=}
+    maxReceiptsPerSubscriptionPayment:
+      STRIPE: 1
+      BRAINTREE: 1
+      GOOGLE_PLAY_BILLING: 1
+      APPLE_APP_STORE: 1
+  ecKeys:
+    tableName: swarm_keys
+  ecSignedPreKeys:
+    tableName: swarm_repeated_use_signed_ec_pre_keys
+  pagedPqKeys:
+    tableName: swarm_paged_pq_keys
+  pqLastResortKeys:
+    tableName: swarm_repeated_use_signed_kem_pre_keys
+  messages:
+    tableName: swarm_messages
+    expiration: P30D
+  onetimeDonations:
+    tableName: swarm_onetime_donations
+    expiration: P90D
+  phoneNumberIdentifiers:
+    tableName: swarm_pni
+  profileAvatars:
+    tableName: swarm_profile_avatars
+  profiles:
+    tableName: swarm_profiles
+  profilesV2:
+    tableName: swarm_profiles_v2
+  pushChallenge:
+    tableName: swarm_push_challenge
+  pushNotificationExperimentSamples:
+    tableName: swarm_push_notification_experiment_samples
+  redeemedReceipts:
+    tableName: swarm_redeemed_receipts
+  registrationRecovery:
+    tableName: swarm_registration_recovery_passwords
+    expiration: P300D
+  remoteConfig:
+    tableName: swarm_remote_config
+  reportMessage:
+    tableName: swarm_report_messages
+  scheduledJobs:
+    tableName: swarm_scheduled_jobs
+    expiration: P7D
+  subscriptions:
+    tableName: swarm_subscriptions
+  verificationSessions:
+    tableName: swarm_verification_sessions
+
+# Message store. One single-process FoundationDB cluster. The cluster file is written by the
+# foundationdb container into a shared volume mounted read-only at /etc/foundationdb.
+foundationDbMessages:
+  maxWatchesPerClient: 10000
+  transactionTimeout: PT1S
+  transactionRetryLimit: 3
+  batchPriorityTransactionTimeout: PT5S
+  batchPriorityTransactionRetryLimit: 10
+  versionstampCipherKeys:
+    0: secret://foundationDbMessages.versionstampCipherKey.0
+  currentVersionstampCipherKey: 0
+  clusters:
+    "messages-0":
+      clusterFileUrl: ${SWARM_FDB_CLUSTER_FILE_URL:-file:///etc/foundationdb/fdb.cluster}
+  epochs:
+    0:
+      - messages-0
+
+# Four Redis clusters, one per role (see docker-compose.yml for why each is its own cluster).
+cacheCluster:
+  configurationUri: ${SWARM_REDIS_CACHE_URI:-redis://redis-cache:6379}
+  timeout: PT3S
+
+pushSchedulerCluster:
+  configurationUri: ${SWARM_REDIS_PUSHSCHEDULER_URI:-redis://redis-pushscheduler:6379}
+  timeout: PT3S
+
+rateLimitersCluster:
+  configurationUri: ${SWARM_REDIS_RATELIMITERS_URI:-redis://redis-ratelimiters:6379}
+  timeout: PT3S
+
+messageCache:
+  persistDelayMinutes: 10
+  cluster:
+    configurationUri: ${SWARM_REDIS_MESSAGES_URI:-redis://redis-messages:6379}
+    timeout: PT3S
+
+# Standalone Redis: `pubsub` is a single-node client, not a cluster client.
+pubsub:
+  uri: ${SWARM_REDIS_PUBSUB_URI:-redis://redis-pubsub:6379}
+  timeout: PT3S
+
+# ---------------------------------------------------------------------------- object storage
+
+# CDN / attachments, served by MinIO. The AWS SDK addresses S3 virtual-host style, so the
+# compose network gives MinIO the alias swarm-cdn.minio.swarm.local and MinIO is started with
+# MINIO_DOMAIN=minio.swarm.local so it accepts that form.
+cdn:
+  bucket: ${SWARM_CDN_BUCKET:-swarm-cdn}
+  region: ${SWARM_AWS_REGION:-us-east-1}
+  endpointOverride: ${SWARM_S3_ENDPOINT:-http://minio.swarm.local:9000}
+  credentials:
+    type: static
+    accessKeyId: secret://cdn.accessKey
+    secretAccessKey: secret://cdn.accessSecret
+
+# Paged single-use post-quantum (KEM) prekeys. Written with the global AWS credentials.
+pagedSingleUseKEMPreKeyStore:
+  bucket: ${SWARM_PREKEY_BUCKET:-swarm-prekeys}
+  region: ${SWARM_AWS_REGION:-us-east-1}
+  endpointOverride: ${SWARM_S3_ENDPOINT:-http://minio.swarm.local:9000}
+
+# Dynamic configuration. `DynamicConfigurationManager.getConfiguration()` blocks until the
+# first successful read, so this object MUST exist: minio/bootstrap-buckets.sh uploads it.
+# To change staging's dynamic config, upload a new version of the object; the server picks it
+# up within refreshInterval.
+dynamicConfig:
+  s3Region: ${SWARM_AWS_REGION:-us-east-1}
+  s3Bucket: ${SWARM_CONFIG_BUCKET:-swarm-config}
+  objectKey: dynamic-config.yaml
+  endpointOverride: ${SWARM_S3_ENDPOINT:-http://minio.swarm.local:9000}
+  maxSize: 1000000
+  refreshInterval: PT30S
+
+# Autonomous-system table used for rate-limit bucketing. AsnInfoProviderImpl.fromTsvGz reads
+# a GZIPPED 5-column TSV (start_ip, end_ip, AS_number, country_code, AS_description) in the
+# iptoasn.com format. minio/bootstrap-buckets.sh gzips minio/asn.tsv and uploads it. Replace
+# the object with the real iptoasn.com dump if ASN-based rate limiting ever matters.
+asnTable:
+  s3Region: ${SWARM_AWS_REGION:-us-east-1}
+  s3Bucket: ${SWARM_CONFIG_BUCKET:-swarm-config}
+  objectKey: asn.tsv.gz
+  endpointOverride: ${SWARM_S3_ENDPOINT:-http://minio.swarm.local:9000}
+  maxSize: 100000000
+  refreshInterval: PT1H
+
+# ---------------------------------------------------------------------------- registration
+
+# The staging registration channel. `type: swarm-staging` is a SWARM addition that drops the
+# Google Cloud identity token and nothing else; it refuses to build unless the environment
+# variable SWARM_STAGING_FIXED_CODE is exactly "true". See docs/SWARM-CHANGES.md and
+# registration-stub/README.md.
+#
+# registrationCaCertificate must be the PEM of the CA created by certs/make-certs.sh. It is
+# passed as a single-line environment variable with \n escapes, because a YAML
+# double-quoted scalar turns those back into newlines. `make-certs.sh` prints the value and
+# generate-secrets.sh writes it into .env.
+registrationService:
+  type: swarm-staging
+  host: ${SWARM_REGISTRATION_HOST:-registration-stub}
+  port: ${SWARM_REGISTRATION_PORT:-8443}
+  registrationCaCertificate: "${SWARM_REGISTRATION_CA_PEM}"
+  collationKeySalt: secret://registrationService.collationKeySalt
+
+# WebAuthn for registration. Origins must be the real public origin of the chat host.
+registrationWebAuthn:
+  relyingPartyId: ${SWARM_CHAT_DOMAIN:-chat.swarm.green}
+  origins:
+    - https://${SWARM_CHAT_DOMAIN:-chat.swarm.green}
+  challengeTtl: PT2M
+  userHandleBlindingSecret: secret://registrationWebAuthn.userHandleBlindingSecret
+
+# Number lookup. Not used by the staging stub; the key is a placeholder.
+hlrLookup:
+  apiKey: secret://hlrLookup.apiKey
+  apiSecret: secret://hlrLookup.apiSecret
+
+shortCode:
+  baseUrl: https://${SWARM_CHAT_DOMAIN:-chat.swarm.green}/shortcodes/
+
+linkDevice:
+  secret: secret://linkDevice.secret
+
+idlePrimaryDeviceReminder:
+  minIdleDuration: P30D
+
+# ---------------------------------------------------------------------------- zk / sealed sender
+
+# Generated for THIS deployment by generate-secrets.sh (the server's own `zkparams` and
+# `certificate` commands). groupsZkConfig.serverPublic must be the public half of
+# groupsZkConfig.serverSecret, and unidentifiedDelivery.certificate must be signed by the
+# trust root the SWARM Messenger clients ship. See docs/STAGING.md.
+callingZkConfigPreV101:
+  serverSecret: secret://callingZkConfigPreV101.serverSecret
+
+callingZkConfig:
+  serverSecret: secret://callingZkConfigV101.serverSecret
+
+chatZkConfig:
+  serverSecret: secret://chatZkConfig.serverSecret
+
+groupsZkConfig:
+  serverPublic: ${SWARM_GROUPS_ZK_SERVER_PUBLIC}
+  serverSecret: secret://groupsZkConfig.serverSecret
+
+unidentifiedDelivery:
+  certificate: ${SWARM_UNIDENTIFIED_DELIVERY_CERTIFICATE}
+  privateKey: secret://unidentifiedDelivery.privateKey
+  expiresDays: 7
+  embedSigner: true
+
+# ---------------------------------------------------------------------------- disabled: enclaves
+# SVR2 / SVRB (PIN recovery) and CDSI (contact discovery) run in SGX enclaves that this stack
+# does not have. The blocks below exist only because the configuration requires them. The
+# hostnames do not resolve, the shared secrets are placeholders, and the certificates are the
+# self-signed test certificates from upstream's test configuration. Effect for clients:
+# no PIN-based recovery, no server-side contact discovery. See docs/STAGING.md.
+
+directoryV2:
+  client:
+    userAuthenticationTokenSharedSecret: secret://directoryV2.client.userAuthenticationTokenSharedSecret
+    userIdTokenSharedSecret: secret://directoryV2.client.userIdTokenSharedSecret
+
+svr2:
+  uri: svr2.disabled.swarm.invalid
+  userAuthenticationTokenSharedSecret: secret://svr2.userAuthenticationTokenSharedSecret
+  userIdTokenSharedSecret: secret://svr2.userIdTokenSharedSecret
+  svrCaCertificates:
+    # Upstream's published self-signed test certificate, from
+    # service/src/test/resources/config/test.yml. It is not a secret and it is not trusted by
+    # anything: it exists so the block parses. Anchored here and aliased below.
+    - &placeholderCertificate |
+      -----BEGIN CERTIFICATE-----
+      MIIDazCCAlOgAwIBAgIUW5lcNWkuynRVc8Rq5pO6mHQBuZAwDQYJKoZIhvcNAQEL
+      BQAwRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM
+      GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yNDAzMjUwMzE4MTNaFw0yOTAz
+      MjQwMzE4MTNaMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw
+      HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggEiMA0GCSqGSIb3DQEB
+      AQUAA4IBDwAwggEKAoIBAQCfH4Um+fv2r4KudhD37/UXp8duRLTmp4XvpBTpDHpD
+      2HF8p2yThVKlJnMkP/9Ey1Rb0vhxO7DCltLdW8IYcxJuHoyMvyhGUEtxxkOZbrk8
+      ciUR9jTZ37x7vXRGj/RxcdlS6iD0MeF0D/LAkImt4T/kiKwDbENrVEnYWJmipCKP
+      ribxWky7HqxDCoYMQr0zatxB3A9mx5stH+H3kbw3CZcm+ugF9ZIKDEVHb0lf28gq
+      llmD120q/vs9YV3rzVL7sBGDqf6olkulvHQJKElZg2rdcHWFcngSlU2BjR04oyuH
+      c/SSiLSB3YB0tdFGta5uorXyV1y7RElPeBfOfvEjsG3TAgMBAAGjUzBRMB0GA1Ud
+      DgQWBBQX+xlgSWWbDjv0SrJ+h67xauJ80zAfBgNVHSMEGDAWgBQX+xlgSWWbDjv0
+      SrJ+h67xauJ80zAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAw
+      ZG2MCCjscn6h/QOoJU+IDfa68OqLq0I37gMnLMde4yEhAmm//miePIq4Uz9GRJ+h
+      rAmdEnspKgyQ93PjF7Xpk/JdJA4B1bIrsOl/cSwqx2sFhRt8Kt1DHGlGWXqOaHRP
+      UkZ86MyRL3sXly6WkxEYxZJeQaOzMy2XmQh7grzrlTBuSI+0xf7vsRRDipxr6LVQ
+      6qGWyGODLLc2JD1IXj/1HpRVT2LoGGlKMuyxACQAm4oak1vvJ9mGxgfd9AU+eo58
+      O/esB2Eaf+QqMPELdFSZQfG2jvp+3WQTZK8fDKHyLr076G3UetEMy867F6fzTSZd
+      9Kxq0DY7RCEpdHMCKcOL
+      -----END CERTIFICATE-----
+
+svrb:
+  uri: svrb.disabled.swarm.invalid
+  userAuthenticationTokenSharedSecret: secret://svrb.userAuthenticationTokenSharedSecret
+  userIdTokenSharedSecret: secret://svrb.userIdTokenSharedSecret
+  svrCaCertificates:
+    - *placeholderCertificate
+
+storageService:
+  uri: storage.disabled.swarm.invalid
+  userAuthenticationTokenSharedSecret: secret://storageService.userAuthenticationTokenSharedSecret
+  storageCaCertificates:
+    - *placeholderCertificate
+
+keyTransparencyService:
+  host: kt.disabled.swarm.invalid
+  port: 443
+  tlsCertificate: *placeholderCertificate
+  clientCertificate: *placeholderCertificate
+  clientPrivateKey: secret://keyTransparencyService.clientPrivateKey
+
+# ---------------------------------------------------------------------------- disabled: push
+# No APNs certificate and no FCM project. Desktop clients receive messages over the
+# websocket, which needs no push service. Mobile clients will not wake on new messages until
+# real credentials are configured. The values below are upstream's test placeholders: they
+# parse, so the server starts, and they cannot reach Apple or Google.
+
+apn:
+  sandbox: true
+  bundleId: green.swarm.messenger.staging
+  keyId: secret://apn.keyId
+  teamId: secret://apn.teamId
+  signingKey: secret://apn.signingKey
+
+fcm:
+  credentials: secret://fcm.credentials
+
+# ---------------------------------------------------------------------------- disabled: GCP attachments
+# Upstream signs CDN0/CDN2 upload URLs with a Google Cloud Storage service account. SWARM
+# staging serves attachments from MinIO through the `cdn` block above; this block only has to
+# parse. CDN0/CDN2 upload forms will not work.
+gcpAttachments:
+  domain: gcs.disabled.swarm.invalid
+  email: disabled@gcs.disabled.swarm.invalid
+  pathPrefix: ""
+  rsaSigningKey: secret://gcpAttachments.rsaSigningKey
+
+attachments:
+  maxAttachmentUploadSizeInBytes: 104857600      # 100 MiB
+  maxMessageBackupUploadSizeInBytes: 104857600
+
+tus:
+  uploadUri: https://${SWARM_CDN_DOMAIN:-cdn.chat.swarm.green}/upload
+  userAuthenticationTokenSharedSecret: secret://tus.userAuthenticationTokenSharedSecret
+
+cdn3StorageManager:
+  baseUri: https://${SWARM_CDN_DOMAIN:-cdn.chat.swarm.green}
+  clientId: swarm-staging
+  clientSecret: secret://cdn3StorageManager.clientSecret
+  sourceSchemes:
+    2: gcs
+    3: r2
+
+# ---------------------------------------------------------------------------- disabled: calling
+# No TURN/SFU server yet. `urls` and `urlsWithIps` are @NotEmpty in
+# CloudflareTurnConfiguration, so they cannot be left empty; they name the planned
+# sfu.chat.swarm.green host. Voice and video calling is non-functional until an SFU and TURN
+# server exist there. No request is made to Cloudflare unless a client asks for credentials.
+turn:
+  cloudflare:
+    apiToken: secret://turn.cloudflare.apiToken
+    endpoint: https://turn.disabled.swarm.invalid/credentials/generate
+    requestedCredentialTtl: PT24H
+    clientCredentialTtl: PT12H
+    urls:
+      - turn:${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}:3478
+    urlsWithIps:
+      - turn:%s
+      - turn:%s:3478?transport=tcp
+    hostname: ${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}
+    numHttpClients: 1
+
+callQualitySurvey:
+  pubSubPublisher: &disabled-pubsub
+    project: swarm-staging-disabled
+    topic: disabled
+    credentialConfiguration: |
+      {
+        "type": "external_account",
+        "credential_source": { "file": "/dev/null" },
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "audience": "//iam.googleapis.com/swarm-staging-disabled",
+        "token_url": "https://sts.disabled.swarm.invalid/v1/token"
+      }
+
+# ---------------------------------------------------------------------------- disabled: payments
+# MobileCoin payments are upstream's feature, not SWARM's. The SWARM wallet is on-device and
+# does not use this. `externalClients` has no non-cloud implementation in the shaded jar, so
+# the currency-conversion clients are configured with placeholder keys and will log failures
+# if a client ever asks for exchange rates.
+paymentsService:
+  userAuthenticationTokenSharedSecret: secret://paymentsService.userAuthenticationTokenSharedSecret
+  # @NotEmpty upstream, so it cannot be an empty list. MOB is upstream's own placeholder.
+  paymentCurrencies:
+    - MOB
+  externalClients:
+    fixerApiKey: secret://paymentsService.fixerApiKey
+    coinGeckoApiKey: secret://paymentsService.coinGeckoApiKey
+    # @NotEmpty upstream, so one entry is the minimum.
+    coinGeckoCurrencyIds:
+      MOB: mobilecoin
+
+# ---------------------------------------------------------------------------- disabled: billing
+# Stripe / Braintree / Google Play / App Store. No merchant account exists and none will for
+# staging. Upstream constructs all four managers unconditionally at startup, so the blocks
+# must parse; the credentials are upstream's test placeholders and cannot authenticate.
+stripe:
+  apiKey: secret://stripe.apiKey
+  idempotencyKeyGenerator: secret://stripe.idempotencyKeyGenerator
+  boostDescription: SWARM staging (disabled)
+  # @NotEmpty map upstream; the currency sets may be empty, and are, because there are no
+  # donation levels configured.
+  supportedCurrenciesByPaymentMethod:
+    CARD: []
+
+braintree:
+  merchantId: disabled
+  publicKey: secret://braintree.publicKey
+  privateKey: secret://braintree.privateKey
+  environment: sandbox
+  graphqlUrl: https://braintree.disabled.swarm.invalid/graphql
+  merchantAccounts:
+    'xts': disabled
+  supportedCurrenciesByPaymentMethod:
+    PAYPAL: []
+  pubSubPublisher: *disabled-pubsub
+
+googlePlayBilling:
+  credentialsJson: |
+    {
+      "type": "external_account",
+      "credential_source": { "file": "/dev/null" },
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "audience": "//iam.googleapis.com/swarm-staging-disabled",
+      "token_url": "https://sts.disabled.swarm.invalid/v1/token"
+    }
+  packageName: green.swarm.messenger.staging
+  applicationName: swarm-messenger-staging
+  productIdToLevel: {}
+
+appleAppStore:
+  env: LOCAL_TESTING
+  bundleId: green.swarm.messenger.staging
+  appAppleId: 1
+  issuerId: disabled
+  keyId: disabled
+  encodedKey: secret://appleAppStore.encodedKey
+  subscriptionGroupId: disabled
+  productIdToLevel: {}
+  appleRootCerts:
+    # Apple's published root CA certificate (https://www.apple.com/certificateauthority/),
+    # the same one upstream's test configuration uses. AppleAppStoreClient builds a signature
+    # verifier at startup and wants at least one parseable root; it is never used because no
+    # App Store subscription exists.
+    - MIIEuzCCA6OgAwIBAgIBAjANBgkqhkiG9w0BAQUFADBiMQswCQYDVQQGEwJVUzETMBEGA1UEChMKQXBwbGUgSW5jLjEmMCQGA1UECxMdQXBwbGUgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxFjAUBgNVBAMTDUFwcGxlIFJvb3QgQ0EwHhcNMDYwNDI1MjE0MDM2WhcNMzUwMjA5MjE0MDM2WjBiMQswCQYDVQQGEwJVUzETMBEGA1UEChMKQXBwbGUgSW5jLjEmMCQGA1UECxMdQXBwbGUgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkxFjAUBgNVBAMTDUFwcGxlIFJvb3QgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDkkakJH5HbHkdQ6wXtXnmELes2oldMVeyLGYne+Uts9QerIjAC6Bg++FAJ039BqJj50cpmnCRrEdCju+QbKsMflZ56DKRHi1vUFjczy8QPTc4UadHJGXL1XQ7Vf1+b8iUDulWPTV0N8WQ1IxVLFVkds5T39pyez1C6wVhQZ48ItCD3y6wsIG9wtj8BMIy3Q88PnT3zK0koGsj+zrW5DtleHNbLPbU6rfQPDgCSC7EhFi501TwN22IWq6NxkkdTVcGvL0Gz+PvjcM3mo0xFfh9Ma1CWQYnEdGILEINBhzOKgbEwWOxaBDKMaLOPHd5lc/9nXmW8Sdh2nzMUZaF3lMktAgMBAAGjggF6MIIBdjAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUK9BpR5R2Cf70a40uQKb3R01/CF4wHwYDVR0jBBgwFoAUK9BpR5R2Cf70a40uQKb3R01/CF4wggERBgNVHSAEggEIMIIBBDCCAQAGCSqGSIb3Y2QFATCB8jAqBggrBgEFBQcCARYeaHR0cHM6Ly93d3cuYXBwbGUuY29tL2FwcGxlY2EvMIHDBggrBgEFBQcCAjCBthqBs1JlbGlhbmNlIG9uIHRoaXMgY2VydGlmaWNhdGUgYnkgYW55IHBhcnR5IGFzc3VtZXMgYWNjZXB0YW5jZSBvZiB0aGUgdGhlbiBhcHBsaWNhYmxlIHN0YW5kYXJkIHRlcm1zIGFuZCBjb25kaXRpb25zIG9mIHVzZSwgY2VydGlmaWNhdGUgcG9saWN5IGFuZCBjZXJ0aWZpY2F0aW9uIHByYWN0aWNlIHN0YXRlbWVudHMuMA0GCSqGSIb3DQEBBQUAA4IBAQBcNplMLXi37Yyb3PN3m/J20ncwT8EfhYOFG5k9RzfyqZtAjizUsZAS2L70c5vu0mQPy3lPNNiiPvl4/2vIB+x9OYOLUyDTOMSxv5pPCmv/K/xZpwUJfBdAVhEedNO3iyM7R6PVbyTi69G3cN8PReEnyvFteO3ntRcXqNx+IjXKJdXZD9Zr1KIkIxH3oayPc4FgxhtbCS+SsvhESPBgOJ4V9T0mZyCKM2r3DYLP3uujL/lTaltkwGMzd/c6ByxW69oPIQ7aunMZT7XZNn/Bh1XZp5m5MkL72NVxnn6hUrcbvZNCJBIqxw8dtk2cXmPIS4AXUKqK1drk/NAJBzewdXUh
+
+appleDeviceCheck:
+  production: false
+  teamId: disabled
+  bundleId: green.swarm.messenger.staging
+
+deviceCheck:
+  backupRedemptionDuration: P30D
+
+subscription:
+  badgeExpiration: P30D
+  badgeGracePeriod: P15D
+  backupExpiration: P30D
+  backupGracePeriod: P15D
+  backupFreeTierMediaDuration: P30D
+  backupLevels: {}
+  levels: {}
+
+loginPurchase:
+  playProductId: disabled
+  playOptionId: disabled
+  appStoreProductId: disabled
+
+oneTimeDonations:
+  sepaMaximumEuros: '0'
+  boost:
+    expiration: P90D
+    badge: SWARM
+  gift:
+    expiration: P90D
+    badge: SWARM
+  currencies: {}
+
+badges:
+  badges:
+    - id: SWARM
+      category: other
+      sprites:
+        - sprite-1.png
+        - sprite-2.png
+        - sprite-3.png
+        - sprite-4.png
+        - sprite-5.png
+        - sprite-6.png
+      svg: swarm.svg
+      svgs:
+        - light: swarm-light.svg
+          dark: swarm-dark.svg
+  receiptLevels:
+    ONE_TIME_DONATION: SWARM
+
+# ---------------------------------------------------------------------------- misc
+
+remoteConfig:
+  globalConfig: {}
+
+openTelemetry:
+  enabled: false
+  environment: swarm-staging
+  shutdownWaitDuration: PT0S
+  url: http://127.0.0.1:4318/
