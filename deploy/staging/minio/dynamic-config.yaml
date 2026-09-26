@@ -1,0 +1,26 @@
+# SWARM Messenger staging — dynamic configuration.
+#
+# Uploaded to s3://${SWARM_CONFIG_BUCKET}/dynamic-config.yaml by bootstrap-buckets.sh and
+# polled by the chat server every 30s (staging.yml: dynamicConfig.refreshInterval).
+# `DynamicConfigurationManager.getConfiguration()` blocks until the first successful read, so
+# this object must exist and must parse, or the server hangs during startup.
+#
+# Validate a change before uploading it:
+#   java -Dsecrets.bundle.filename=staging-secrets.yml -jar <jar> check-dynamic-config <file>
+# then:
+#   docker compose run --rm -v "$PWD/minio:/in:ro" minio-bootstrap \
+#     sh -c 'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
+#            mc cp /in/dynamic-config.yaml local/swarm-config/dynamic-config.yaml'
+#
+# The schema is org.whispersystems.textsecuregcm.configuration.dynamic.DynamicConfiguration;
+# every section has a default, so an almost-empty file is valid.
+
+# The spam-filter submodule is absent from this build, so the server falls back to the no-op
+# captcha client: the token "noop.noop.registration.noop" satisfies any captcha requirement.
+# A scoreFloor of 1.0 matches upstream's test configuration.
+captcha:
+  scoreFloor: 1.0
+
+# Allow every client to use the gRPC surface. Staging has no staged rollout.
+grpcAllowList:
+  enableAll: true
