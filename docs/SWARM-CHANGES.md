@@ -102,8 +102,10 @@ New directory. Nothing outside it is affected and the upstream build ignores it.
 | `docker-compose.yml` | FoundationDB (messages), DynamoDB Local, four single-node Redis clusters + one standalone Redis, MinIO (S3), the registration stub, the chat server, Caddy (profile `edge`) |
 | `staging.yml` | the chat server configuration. Derived from upstream's own `service/src/test/resources/config/test.yml`; only the storage/registration endpoints differ. Annotated block by block |
 | `staging-secrets.yml.example`, `.env.example` | templates. The filled-in files are git-ignored |
-| `generate-secrets.sh` | generates this deployment's secrets using the server's own `zkparams` and `certificate` commands (i.e. libsignal), plus `openssl rand` |
-| `Dockerfile` | the chat server image: `eclipse-temurin:26-jre-resolute` + the shaded jar + `libfdb_c.so`, mirroring upstream's jib configuration |
+| `bootstrap-host.sh` | one command on a fresh Ubuntu 24.04 host: Docker Engine + compose plugin, Temurin JDK 26, a checkout at a pinned commit, the build, the secrets, the stack, Let's Encrypt, and a verification pass |
+| `generate-secrets.sh` | generates this deployment's secrets using the server's own `certificate` command and `zkparams/SwarmZkParams.java` (i.e. libsignal), plus `openssl rand`, and writes `shared/staging-public-params.json` for the client builds |
+| `zkparams/SwarmZkParams.java` | generates all four sets of zero-knowledge server parameters. Upstream's `zkparams` command produces only `ServerSecretParams`; three of the four configuration blocks need `GenericServerSecretParams`, which is a different libsignal type of a different length |
+| `Dockerfile`, `prepare-image.sh`, `.dockerignore` | the chat server image: `eclipse-temurin:26-jre-resolute` + the shaded jar + `libfdb_c.so`, mirroring upstream's jib configuration. `prepare-image.sh` stages exactly those two files so the `COPY` is unambiguous and the build context is two files rather than the whole repository |
 | `dynamodb/bootstrap-tables.sh` | creates all 34 tables and their TTLs. Every key schema cites the Java class and constant it came from |
 | `foundationdb/init-foundationdb.sh` | `configure new single ssd` on first start; idempotent |
 | `minio/bootstrap-buckets.sh`, `minio/dynamic-config.yaml`, `minio/asn.tsv` | the three buckets, a scoped CDN credential, and the two objects the server polls |
@@ -144,6 +146,9 @@ Upstream's `README.md` and `LICENSE` are untouched.
 * **`-Pexclude-spam-filter`.** Not a SWARM profile. It is upstream's, and it is what builds the
   shaded runnable jar and downloads `libfdb_c.so`. It has no `<activation>` block in
   `service/pom.xml`, so it must be named on the command line.
+* **The zk parameter types.** Nothing was changed in how the server reads them.
+  `SwarmZkParams.java` exists because upstream simply has no command for
+  `GenericServerSecretParams`; it calls libsignal's own generator.
 
 ---
 
