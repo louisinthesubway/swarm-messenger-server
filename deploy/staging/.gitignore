@@ -6,9 +6,17 @@
 .env
 staging-secrets.yml
 
+# Public, but deployment-specific: regenerated on every host, handed to the client builds by
+# hand rather than committed. See docs/STAGING.md ("Public parameters for the clients").
+shared/
+
 certs/*.key
 certs/*.crt
 certs/*.csr
 certs/*.srl
 certs/*.ext
 certs/*.pem
+
+# Python bytecode from running the stub outside its container.
+__pycache__/
+*.pyc

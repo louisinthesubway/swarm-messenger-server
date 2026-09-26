@@ -15,8 +15,21 @@
 # matching aliases. `mc` itself uses the plain host.
 set -eu
 
-echo "[minio-bootstrap] configuring alias"
-mc alias set local http://minio:9000 "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}"
+# MinIO itself has no compose healthcheck (that would mean assuming which shell utilities its
+# image ships). Readiness is waited for here instead, in an image that certainly has `mc`.
+echo "[minio-bootstrap] waiting for MinIO"
+i=0
+until mc alias set local http://minio:9000 "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" >/dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "${i}" -ge 60 ]; then
+    echo "[minio-bootstrap] FAILED: MinIO did not become reachable in 120s" >&2
+    mc alias set local http://minio:9000 "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" || true
+    exit 1
+  fi
+  sleep 2
+done
+mc ready local >/dev/null 2>&1 || true
+echo "[minio-bootstrap] MinIO is up"
 
 for bucket in swarm-cdn swarm-prekeys swarm-config; do
   if mc ls "local/${bucket}" >/dev/null 2>&1; then

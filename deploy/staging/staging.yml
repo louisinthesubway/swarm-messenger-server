@@ -24,9 +24,15 @@
 #   server / grpc / externalRequestFilter -> listen addresses for a container
 #
 # Environment variables are substituted before the YAML is parsed (Dropwizard
-# SubstitutingSourceProvider, strict mode), so `${VAR:-default}` works and a `${VAR}` with no
-# default makes the server refuse to start. Secrets are NOT in this file; they are resolved
-# through `secret://` from the bundle named by -Dsecrets.bundle.filename.
+# SubstitutingSourceProvider, strict mode). A reference with a ":-" default falls back to it; a
+# reference without one makes the server refuse to start when the variable is unset.
+#
+# Note that substitution runs over the RAW TEXT of this file, comments included. So a comment
+# must never contain a dollar-brace reference to a variable that is not actually set: the
+# server will stop with "Cannot resolve variable". Name variables in prose, not in syntax.
+#
+# Secrets are NOT in this file; they are resolved through `secret://` from the bundle named by
+# -Dsecrets.bundle.filename.
 
 logging:
   level: ${SWARM_LOG_LEVEL:-INFO}
@@ -449,8 +455,13 @@ turn:
     hostname: ${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}
     numHttpClients: 1
 
+# Google Cloud Pub/Sub, used upstream for call-quality telemetry and donation events. The
+# external-account credential below points at nothing, so a publish attempt fails and is
+# logged. Nothing in staging publishes. (The block is repeated verbatim under `braintree`
+# rather than shared with a YAML anchor: Dropwizard's YAML mapper does not resolve an alias
+# into a polymorphic object, it hands the alias name over as a string.)
 callQualitySurvey:
-  pubSubPublisher: &disabled-pubsub
+  pubSubPublisher:
     project: swarm-staging-disabled
     topic: disabled
     credentialConfiguration: |
@@ -502,7 +513,17 @@ braintree:
     'xts': disabled
   supportedCurrenciesByPaymentMethod:
     PAYPAL: []
-  pubSubPublisher: *disabled-pubsub
+  pubSubPublisher:
+    project: swarm-staging-disabled
+    topic: disabled
+    credentialConfiguration: |
+      {
+        "type": "external_account",
+        "credential_source": { "file": "/dev/null" },
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "audience": "//iam.googleapis.com/swarm-staging-disabled",
+        "token_url": "https://sts.disabled.swarm.invalid/v1/token"
+      }
 
 googlePlayBilling:
   credentialsJson: |
