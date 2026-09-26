@@ -20,3 +20,6 @@ certs/*.pem
 # Python bytecode from running the stub outside its container.
 __pycache__/
 *.pyc
+
+# Staged by prepare-image.sh: the jar and the FoundationDB client library the chat image copies.
+build/

@@ -159,18 +159,21 @@ git checkout swarm-main
 
 cd deploy/staging
 
-# 2. Generate this deployment's secrets, internal CA, .env and staging-secrets.yml.
-#    Uses the server's own zkparams/certificate commands, i.e. libsignal.
+# 2. Stage exactly what the chat image needs (one jar, one libfdb_c.so) into build/.
+./prepare-image.sh
+
+# 3. Generate this deployment's secrets, internal CA, .env and staging-secrets.yml.
+#    Uses the server's own certificate command and zkparams/SwarmZkParams.java, i.e. libsignal.
 ./generate-secrets.sh
 
-# 3. One value the script cannot know.
+# 4. One value the script cannot know.
 $EDITOR .env          # set SWARM_ACME_EMAIL
 
-# 4. Bring it up. Compose ordering is in the file: the bootstrap one-shots must finish
+# 5. Bring it up. Compose ordering is in the file: the bootstrap one-shots must finish
 #    before `chat` starts.
 docker compose up -d
 
-# 5. Watch the server come up. Expect 60-150s before /healthcheck answers.
+# 6. Watch the server come up. Expect 60-150s before /healthcheck answers.
 docker compose logs -f chat
 ```
 

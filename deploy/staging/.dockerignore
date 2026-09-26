@@ -1,0 +1,8 @@
+# Build context for the chat image is this directory. Only build/ is ever COPYed in, but the
+# whole context is sent to the Docker daemon, so keep the secrets out of it.
+#
+# Exclude everything, then re-admit exactly the two staged files.
+
+*
+!build/chat.jar
+!build/libfdb_c.so

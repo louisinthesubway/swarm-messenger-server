@@ -296,8 +296,10 @@ services:
   chat:
     <<: *restart
     build:
-      context: ../..
-      dockerfile: deploy/staging/Dockerfile
+      # Context is this directory; the image copies only build/chat.jar and build/libfdb_c.so,
+      # which prepare-image.sh stages. Run ./prepare-image.sh before `docker compose build`.
+      context: .
+      dockerfile: Dockerfile
     image: swarm-messenger/chat:staging
     hostname: chat
     depends_on:

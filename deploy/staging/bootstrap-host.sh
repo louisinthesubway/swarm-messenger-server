@@ -214,6 +214,10 @@ info "public parameters: ${STAGING}/shared/staging-public-params.json"
 
 log "7/9  building images and starting the stack"
 
+# Stages the jar and libfdb_c.so into build/, so the Dockerfile has one unambiguous source for
+# each and the build context stays two files instead of the whole repository.
+./prepare-image.sh "${SWARM_CHECKOUT}/${JAR}"
+
 docker compose build
 docker compose up -d
 

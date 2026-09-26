@@ -18,7 +18,8 @@ DNS, start order, health checks, and the full list of what is disabled and why.
 | `bootstrap-host.sh` | one command on a fresh Ubuntu 24.04 host: Docker, JDK 26, a pinned checkout, the build, the secrets, the stack, and Let's Encrypt |
 | `generate-secrets.sh` | generates this deployment's zk parameters, sealed-sender trust root, random shared secrets, internal CA, `.env`, `staging-secrets.yml` and `shared/staging-public-params.json` |
 | `zkparams/SwarmZkParams.java` | generates all four sets of zero-knowledge server parameters with libsignal. The server's own `zkparams` command only produces one of the two types needed |
-| `Dockerfile` | the chat server image (build context is the repository root) |
+| `prepare-image.sh` | stages the shaded jar and `libfdb_c.so` into `build/`, which is all the chat image copies |
+| `Dockerfile` | the chat server image. Build context is this directory; see `prepare-image.sh` for why |
 | `dynamodb/bootstrap-tables.sh` | creates all 34 DynamoDB tables and their TTLs; every schema is annotated with the Java class it comes from |
 | `foundationdb/init-foundationdb.sh` | `configure new single ssd` on first start |
 | `minio/bootstrap-buckets.sh` | creates the three buckets, the scoped CDN key, and uploads the two objects the server polls |
@@ -41,6 +42,7 @@ By hand:
 cd ../..                                               # the repository root
 ./mvnw -DskipTests -Pexclude-spam-filter package       # the profile is REQUIRED
 cd deploy/staging
+./prepare-image.sh                                     # stages the jar + libfdb_c.so
 ./generate-secrets.sh
 $EDITOR .env                                           # set SWARM_ACME_EMAIL
 docker compose up -d
