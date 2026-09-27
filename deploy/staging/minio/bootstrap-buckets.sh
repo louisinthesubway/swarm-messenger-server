@@ -67,6 +67,21 @@ JSON
 mc admin policy create local swarm-cdn-rw /tmp/swarm-cdn-policy.json 2>/dev/null || true
 mc admin policy attach local swarm-cdn-rw --user "${SWARM_CDN_ACCESS_KEY}" 2>/dev/null || true
 
+# The server's GLOBAL credentials (awsCredentialsProvider: prekey bucket, the polled
+# swarm-config objects) must also be a MinIO user. 2026-09-27, first real host: without this
+# every S3ObjectMonitor read answered 403 and the server never became healthy.
+if [ -n "${SWARM_AWS_ACCESS_KEY_ID:-}" ]; then
+  if mc admin user info local "${SWARM_AWS_ACCESS_KEY_ID}" >/dev/null 2>&1; then
+    echo "[minio-bootstrap] = user (global aws credentials) exists"
+  else
+    mc admin user add local "${SWARM_AWS_ACCESS_KEY_ID}" "${SWARM_AWS_SECRET_ACCESS_KEY}"
+    echo "[minio-bootstrap] + user (global aws credentials)"
+  fi
+  mc admin policy attach local readwrite --user "${SWARM_AWS_ACCESS_KEY_ID}" 2>/dev/null || true
+else
+  echo "[minio-bootstrap] WARNING: SWARM_AWS_ACCESS_KEY_ID not set; the chat server will get 403s" >&2
+fi
+
 # The two polled objects. Always re-uploaded, so editing minio/dynamic-config.yaml and
 # re-running this service is how staging's dynamic configuration is changed.
 echo "[minio-bootstrap] uploading dynamic-config.yaml"

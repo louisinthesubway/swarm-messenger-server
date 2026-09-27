@@ -260,6 +260,8 @@ services:
       MINIO_ROOT_PASSWORD: ${SWARM_MINIO_ROOT_PASSWORD:?set SWARM_MINIO_ROOT_PASSWORD in .env}
       SWARM_CDN_ACCESS_KEY: ${SWARM_CDN_ACCESS_KEY:-swarmcdn}
       SWARM_CDN_SECRET_KEY: ${SWARM_CDN_SECRET_KEY:?set SWARM_CDN_SECRET_KEY in .env}
+      SWARM_AWS_ACCESS_KEY_ID: ${SWARM_AWS_ACCESS_KEY_ID:?set SWARM_AWS_ACCESS_KEY_ID in .env}
+      SWARM_AWS_SECRET_ACCESS_KEY: ${SWARM_AWS_SECRET_ACCESS_KEY:?set SWARM_AWS_SECRET_ACCESS_KEY in .env}
     volumes:
       - ./minio/bootstrap-buckets.sh:/bootstrap-buckets.sh:ro
       - ./minio/dynamic-config.yaml:/in/dynamic-config.yaml:ro
