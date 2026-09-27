@@ -54,7 +54,7 @@ Published on the host:
 | 80 | `0.0.0.0` | Caddy | ACME challenge and HTTP→HTTPS redirect |
 | 8080 | `127.0.0.1` | chat | h2c REST + websocket. Loopback only; Caddy reaches it over the Docker network |
 | 8081 | `127.0.0.1` | chat | Dropwizard admin: `/healthcheck`, `/metrics`. **Never publish this** |
-| 50051 | `127.0.0.1` | chat | the gRPC "omnibus" listener. Publish it only when a client actually needs gRPC, and put it behind TLS |
+| 50051 | `127.0.0.1` | chat | the gRPC "omnibus" listener (h2c). Not published: Caddy carries `application/grpc` requests from `chat.swarm.green` to it over the Docker network, with PROXY protocol v2 (section 5b) |
 
 Internal to the Docker network `swarm-staging` (10.77.0.0/24), never published:
 
@@ -90,7 +90,7 @@ Four names, all `A` (and `AAAA` if the host has IPv6) to the staging host:
 
 | Name | Answered by | Status |
 |---|---|---|
-| `chat.swarm.green` | Caddy → chat:8080 | **required.** The API and the websocket. This is the only endpoint clients talk to |
+| `chat.swarm.green` | Caddy → chat:8080 (REST, websocket), chat:50051 (gRPC) | **required.** The API, the websocket and gRPC. This is the only endpoint clients talk to |
 | `cdn.chat.swarm.green` | Caddy → MinIO and the `tus` service | **required for attachments and avatars.** Anonymous GET/HEAD of `attachments/*` and `profiles/*`, TUS uploads under `/upload/attachments` (token from the chat server), avatar POST forms (signed by the chat server). Nothing else; see section 8a |
 | `reg.chat.swarm.green` | Caddy, returns 404 | **reserved, deliberately not proxied.** The registration stub accepts one fixed code for every phone number; publishing it would let anyone register any number. The name exists so a misconfigured client fails loudly instead of silently reaching something else |
 | `sfu.chat.swarm.green` | nothing yet | **reserved.** Named in the TURN configuration because `CloudflareTurnConfiguration.urls` is `@NotEmpty` and cannot be left empty. No SFU or TURN server is deployed, so calling does not work |
@@ -397,8 +397,16 @@ Consequences to know:
 * Browsers may now also open WebSockets over HTTP/2 to `chat.swarm.green`; Caddy converts those
   the same way.
 
-Status: **proposed** at the time of writing; the Live Log in the project vault ("Opus M-H
-discovery") records when each step was implemented and what was tested.
+Status (2026-09-27): steps 1-3 **live** on the staging host since 18:25 UTC (swarm-main
+`885ec3aa6`). Tested from outside through `https://chat.swarm.green` with an HTTP/2 client: the
+peer's settings carry `enableConnectProtocol = true`; an extended CONNECT to `/v1/websocket/`
+answers `200` with `x-signal-timestamp` and echoes a websocket ping; `/v1/websocket/provisioning/`
+answers `200` and delivers the provisioning address; gRPC to
+`AccountsAnonymous/CheckAccountExistence` answers `grpc-status 3`, `Accounts/ReserveUsernameHash`
+without credentials `16`. HTTP/1.1 clients are unchanged (`101` on the websocket upgrade). A packet
+capture on the compose bridge shows Caddy's PROXY v2 header with the client's public address in
+front of the h2c preface. Step 4 is `swarm-libsignal-0.101.2-swarm.2`. The Live Log in the project
+vault ("Opus M-H discovery") has the details.
 
 ---
 
