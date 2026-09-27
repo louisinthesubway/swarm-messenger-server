@@ -13,6 +13,14 @@
 # as 502 (found 2026-09-27 with the first live edge). Jetty's h2c connector also speaks plain
 # HTTP/1.1, and an HTTP/1.1 websocket upgrade to chat:8080 answers 101, so that route pins 1.1.
 #
+# libsignal's HTTP/2 chat connection (swarm-libsignal 0.101.2-swarm.2 and later) opens the same
+# websocket as an RFC 8441 extended CONNECT and sends gRPC on that connection. Caddy advertises
+# extended CONNECT only because docker-compose.yml runs it with GODEBUG=http2xconnect=1 (Go's
+# HTTP/2 server keeps it off otherwise); its reverse proxy turns such a websocket into the same
+# HTTP/1.1 upgrade toward chat:8080. gRPC (Content-Type application/grpc) goes to the server's
+# omnibus listener chat:50051 over h2c, with PROXY protocol v2 so the server sees the client's
+# address. See docs/STAGING.md, section 5b.
+#
 # The alternative is to skip Caddy entirely and let the JVM terminate TLS: replace the `h2c`
 # application connector in staging.yml with an `h2` connector and point tlsKeyStore at a
 # PKCS#12 keystore. Caddy is the default because renewals are then somebody else's problem.
@@ -38,6 +46,23 @@
 			}
 			# Message delivery holds the socket open indefinitely.
 			flush_interval -1
+		}
+	}
+
+	# gRPC on libsignal's HTTP/2 chat connection: usernames, devices, backups and the other
+	# calls libsignal only makes over gRPC. The omnibus listener routes every path except the
+	# websocket ones to the server's in-process gRPC services; the Authorization header (HTTP
+	# Basic, as on the websocket) passes through untouched. 50051 is not published on the host.
+	@grpc protocol grpc
+	handle @grpc {
+		reverse_proxy chat:50051 {
+			transport http {
+				versions h2c 2
+				# The omnibus reads the client address from a PROXY v2 header (upstream puts a
+				# PPv2 load balancer in front of it). Caddy opens one upstream connection per
+				# request when this is on.
+				proxy_protocol v2
+			}
 		}
 	}
 

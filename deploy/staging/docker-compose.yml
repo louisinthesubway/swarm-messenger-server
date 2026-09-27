@@ -379,6 +379,10 @@ services:
       SWARM_CHAT_DOMAIN: ${SWARM_CHAT_DOMAIN:-chat.swarm.green}
       SWARM_CDN_DOMAIN: ${SWARM_CDN_DOMAIN:-cdn.chat.swarm.green}
       SWARM_ACME_EMAIL: ${SWARM_ACME_EMAIL:?set SWARM_ACME_EMAIL in .env}
+      # Go's HTTP/2 server advertises RFC 8441 extended CONNECT only with this set. libsignal's
+      # HTTP/2 chat connection opens its websocket that way; without it such a client cannot
+      # connect at all. See docs/STAGING.md, section 5b.
+      GODEBUG: http2xconnect=1
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
