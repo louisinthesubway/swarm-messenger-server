@@ -419,6 +419,181 @@ demonstrably boots a server with them (`./mvnw integration-test -Ptest-server`).
 
 ---
 
+## 8a. Attachments and avatars
+
+Contract written 2026-09-27 (Opus M-J) from this revision's code and the desktop client's, before
+the implementation. What is implemented and what was tested on the host is recorded at the end
+of this section and in the vault Live Log.
+
+Every byte that reaches the CDN is **ciphertext**. The client encrypts an attachment with a
+random per-attachment key (AES-256-CBC + HMAC-SHA256) that travels only inside the end-to-end
+encrypted message, and an avatar with the profile key. Neither the chat server, the upload
+service nor MinIO ever sees a key. Object names are random, and anyone who knows one can fetch
+the ciphertext, exactly as on Signal's own CDNs.
+
+| What | Upload | Stored in MinIO bucket `swarm-cdn` as | Read with |
+|---|---|---|---|
+| message attachments (images, files, voice notes, link-preview images) | **CDN3**: TUS to `https://cdn.chat.swarm.green/upload/attachments`, served by the `tus` service | `attachments/<key>` | `GET https://cdn.chat.swarm.green/attachments/<key>` |
+| profile avatars | **CDN0**: S3 POST-policy form to `https://cdn.chat.swarm.green/`, checked by MinIO | `profiles/<name>` | `GET https://cdn.chat.swarm.green/profiles/<name>` |
+
+CDN2 (Google Cloud Storage resumable uploads) cannot work here and is never handed out once the
+`cdn3` experiment below is on. Upload forms that still said CDN2 are what made the first
+attachment on 2026-09-27 spin forever (`POST https://gcs.disabled.swarm.invalid/...`, DNS failure).
+
+### CDN3: the upload form
+
+`GET /v4/attachments/form/upload?uploadLength=<bytes>` (REST or the chat websocket; the gRPC
+`AttachmentsGrpcService.getUploadForm` does the same). `AttachmentControllerV4` returns a CDN3
+form only to accounts enrolled in the **dynamic-configuration experiment `cdn3`**, and a CDN2 form
+to everyone else. Staging enrols everyone, in `minio/dynamic-config.yaml`:
+
+```yaml
+experiments:
+  cdn3:
+    enrollmentPercentage: 100
+```
+
+There is no weight table in `staging.yml`; that experiment is the switch. The form:
+
+```json
+{
+  "cdn": 3,
+  "key": "<20 characters: base64url of 15 random bytes>",
+  "headers": {
+    "Authorization": "Bearer <JWT>",
+    "Upload-Metadata": "filename <standard base64 of the key>"
+  },
+  "signedUploadLocation": "https://cdn.chat.swarm.green/upload/attachments"
+}
+```
+
+`signedUploadLocation` is `tus.uploadUri` from `staging.yml`
+(`https://` + the CDN domain + `/upload`) followed by `/attachments`.
+
+### CDN3: the token
+
+`TusAttachmentGenerator` signs a JWT with `JwtGenerator`: **HS256**, HMAC key = the 32 bytes that
+`tus.userAuthenticationTokenSharedSecret` in `staging-secrets.yml` decodes to (base64). Header
+`{"alg":"HS256","typ":"JWT"}`. Claims:
+
+| Claim | Value |
+|---|---|
+| `aud` | `"attachments"` |
+| `sub` | the key |
+| `iat` | issue time, seconds |
+| `maxLen` | the `uploadLength` the form was requested for |
+
+There is no `exp`. The upload service follows Signal's own tus-server
+(`github.com/signalapp/tus-server`, `src/index.ts`): the token is accepted for **7 days** after
+`iat`, `aud` must be `attachments`, `sub` must equal the key being written (taken from
+`Upload-Metadata` on POST and from the path on HEAD/PATCH), and `maxLen` must be present. One token
+therefore writes one key, at most `maxLen` bytes, and never more than
+`attachments.maxAttachmentUploadSizeInBytes` (100 MiB). Older upstream revisions used HTTP Basic
+credentials derived from the same secret by HMAC; this revision does not.
+
+### CDN3: upload, resume, download
+
+What the desktop does (`ts/util/uploadAttachment.preload.ts`, `ts/util/uploads/tusProtocol.node.ts`):
+
+```
+POST /upload/attachments                              creation-with-upload, one request
+  Authorization: Bearer <JWT>                         (from the form)
+  Upload-Metadata: filename <base64(key)>
+  Tus-Resumable: 1.0.0
+  Upload-Length: <ciphertext bytes>
+  Content-Type: application/offset+octet-stream
+  <the ciphertext, usually Transfer-Encoding: chunked>
+
+-> 201 Created
+   Location: https://cdn.chat.swarm.green/upload/attachments/<key>
+   Upload-Offset: <bytes stored>
+   Upload-Expires: <RFC 9110 date>
+   Tus-Resumable: 1.0.0
+```
+
+When `Upload-Offset` equals `Upload-Length`, the object is already in MinIO at
+`attachments/<key>` before the 201 is sent, so the recipient can download it the moment the
+message arrives. The client only needs a 2xx.
+
+Only if that connection breaks does the client resume, and it does **not** follow `Location`: it
+builds `<signedUploadLocation>/<key>` itself.
+
+```
+HEAD  /upload/attachments/<key>    Authorization, Tus-Resumable
+-> 200  Upload-Offset, Upload-Length, Cache-Control: no-store
+
+PATCH /upload/attachments/<key>    Authorization, Tus-Resumable,
+                                   Upload-Offset: <offset from HEAD>,
+                                   Content-Type: application/offset+octet-stream, the rest
+-> 204  Upload-Offset
+```
+
+A HEAD for an upload that already finished answers from the stored object (offset = length),
+so a client that lost the 201 stops instead of re-sending. That fixed resume address is why the
+upload service is purpose-built rather than `tusd`: tusd's S3 store names every upload
+`<object-id>+<multipart-id>`, so `<signedUploadLocation>/<key>` would never find it.
+
+| Status | When |
+|---|---|
+| 201 / 200 / 204 | POST / HEAD / PATCH succeeded |
+| 204 | `OPTIONS /upload/attachments`: `Tus-Version: 1.0.0`, `Tus-Extension: creation,creation-with-upload`, `Tus-Max-Size`. No token needed |
+| 400 | `Authorization` is not `Bearer …`; `Upload-Length` or `Upload-Offset` missing or not a number; unreadable `Upload-Metadata`; a key that is not base64url |
+| 401 | no token, bad signature, not HS256, `aud` is not `attachments`, older than 7 days, no `maxLen`, or `sub` is not this key |
+| 404 | HEAD/PATCH for an upload that does not exist (never created, expired, or failed) |
+| 409 | PATCH `Upload-Offset` is not the stored offset; a second POST for a key that already holds bytes (the partial upload is discarded, as upstream does) |
+| 412 | `Tus-Resumable` missing or not `1.0.0` |
+| 413 | `Upload-Length` above `maxLen` or above 100 MiB; a body running past `Upload-Length` (the upload is discarded) |
+| 415 | a body without `Content-Type: application/offset+octet-stream`; an `X-Signal-Checksum-Sha256` that does not match |
+| 500 | MinIO refused or failed the write. The bytes are kept; the next HEAD retries the write. The desktop retries the whole send with a new form anyway |
+
+Partial uploads are kept for 7 days (`Upload-Expires`), then deleted.
+
+**Download.** `GET /attachments/<key>` and `HEAD /attachments/<key>`, no credentials; `Range:
+bytes=<n>-` answers 206 for resumed downloads. The desktop refuses a full download without
+`Content-Length`, which is why the CDN site does not compress (Caddy's encoder would drop it;
+ciphertext does not compress anyway).
+
+### CDN0: avatars
+
+1. `PUT /v1/profile` with `"avatar": true` answers with an upload form made by `PostPolicyGenerator`
+   from the `cdn` block of `staging.yml` (MinIO bucket `swarm-cdn`, region `us-east-1`, the scoped
+   `cdn.accessKey` / `cdn.accessSecret`): `key` (`profiles/` + base64url of 16 random bytes),
+   `credential` (`<cdn.accessKey>/<yyyymmdd>/us-east-1/s3/aws4_request`), `acl` (`private`),
+   `algorithm` (`AWS4-HMAC-SHA256`), `date`, `policy` (base64 JSON: this bucket, this key, 1 to
+   10 MiB, any `Content-Type`, expires in 30 minutes) and `signature` (SigV4 over the policy).
+2. The client `POST`s `multipart/form-data` to `https://cdn.chat.swarm.green/` with the fields
+   `key`, `x-amz-credential`, `acl`, `x-amz-algorithm`, `x-amz-date`, `policy`, `x-amz-signature`,
+   `Content-Type`, then `file` (the encrypted avatar). The edge hands it to MinIO's bucket
+   endpoint; **MinIO** checks the policy and its signature against the scoped CDN key, which may
+   write only to `swarm-cdn`. Success is 204.
+3. Readers fetch `GET https://cdn.chat.swarm.green/profiles/<name>` without credentials and decrypt
+   with the profile key they received in a message.
+
+### The edge for `cdn.chat.swarm.green`
+
+| Method | Path | Goes to | Who checks what |
+|---|---|---|---|
+| POST, PATCH, HEAD, OPTIONS | `/upload/attachments`, `/upload/attachments/*` | `tus:1080` | the service verifies the JWT on every POST, HEAD and PATCH |
+| POST, `Content-Type: multipart/form-data` | `/` | MinIO, bucket `swarm-cdn` | MinIO verifies the POST policy and its SigV4 signature |
+| GET, HEAD | `/attachments/*`, `/profiles/*` | MinIO, bucket `swarm-cdn` | bucket policy: anonymous `s3:GetObject` on exactly these two prefixes; no listing, nothing else |
+| anything else | | 404 | |
+
+Nothing published accepts an unauthenticated write: a TUS write needs the chat server's token, a
+POST-policy write needs a policy signed with the CDN key.
+
+### The upload service: `deploy/staging/tus/`
+
+Node 22, standard library only (`server.mjs`), about the size of the registration stub. It
+stages the bytes of an upload in the volume `tus-data` and, when the last byte arrives, writes the
+object to MinIO with one SigV4 `PutObject`, using its **own** MinIO user, which may only put and
+get objects under `swarm-cdn/attachments/`. Its credentials live in `deploy/staging/tus.env`
+(mode 600, git-ignored), written once by `tus/make-tus-env.sh`: its copy of
+`tus.userAuthenticationTokenSharedSecret` (it must stay equal to the one in
+`staging-secrets.yml`) and its MinIO key. A separate file, so the chat container's environment
+does not change.
+
+---
+
 ## 9. Backup and recovery
 
 | What | Where | How |
