@@ -596,14 +596,16 @@ badges:
 # ---------------------------------------------------------------------------- misc
 
 # Values every client gets on GET /v1/config, next to the per-flag remote configs stored in
-# DynamoDB. Signal Desktop reads the two group size limits with parseIntOrThrow: without them
-# "New group" throws "Failed to parse global.groupsv2.maxGroupSize as an integer" and the whole
-# window goes blank (seen 2026-09-27). 151 is the recommended size a client warns above; 1001 is
-# the hard limit. Groups still need a groups (storage) service - see docs/STAGING.md.
+# DynamoDB. The server PREFIXES each key with "global." (RemoteConfigsManager), so the key
+# groupsv2.maxGroupSize reaches clients as global.groupsv2.maxGroupSize. Signal Desktop reads the
+# two group size limits with parseIntOrThrow: without them "New group" throws "Failed to parse
+# global.groupsv2.maxGroupSize as an integer" and the whole window goes blank (seen 2026-09-27).
+# 151 is the recommended size a client warns above; 1001 is the hard limit. Groups still need a
+# groups (storage) service - see docs/STAGING.md.
 remoteConfig:
   globalConfig:
-    global.groupsv2.maxGroupSize: "151"
-    global.groupsv2.groupSizeHardLimit: "1001"
+    groupsv2.maxGroupSize: "151"
+    groupsv2.groupSizeHardLimit: "1001"
 
 openTelemetry:
   enabled: false
