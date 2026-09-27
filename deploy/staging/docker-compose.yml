@@ -356,7 +356,9 @@ services:
     networks:
       - swarm
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /healthcheck HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
+      # bash, not sh: /dev/tcp is a bash feature and CMD-SHELL runs /bin/sh (dash) in this image,
+      # so the check failed with 'cannot create /dev/tcp/...: Directory nonexistent' (2026-09-27).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /healthcheck HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
       interval: 15s
       timeout: 10s
       retries: 20
