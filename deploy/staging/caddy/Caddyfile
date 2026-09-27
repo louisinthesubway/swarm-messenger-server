@@ -6,8 +6,12 @@
 # requires ports 80 and 443 reachable from the internet and the A/AAAA records already
 # pointing at this host. See docs/STAGING.md ("DNS") before starting it.
 #
-# The chat server speaks cleartext HTTP/2 (h2c) on 8080 inside the compose network, so every
-# route below uses `transport http { versions h2c 2 }`.
+# The chat server speaks cleartext HTTP/2 (h2c) on 8080 inside the compose network, so the
+# plain API route uses `transport http { versions h2c 2 }`. The websocket route must NOT: Go's
+# HTTP/2 client (which Caddy uses for h2c upstreams) refuses any request carrying an Upgrade
+# header ("http2: invalid Upgrade request header"), so every /v1/websocket handshake came back
+# as 502 (found 2026-09-27 with the first live edge). Jetty's h2c connector also speaks plain
+# HTTP/1.1, and an HTTP/1.1 websocket upgrade to chat:8080 answers 101, so that route pins 1.1.
 #
 # The alternative is to skip Caddy entirely and let the JVM terminate TLS: replace the `h2c`
 # application connector in staging.yml with an `h2` connector and point tlsKeyStore at a
@@ -29,7 +33,8 @@
 	handle @websocket {
 		reverse_proxy chat:8080 {
 			transport http {
-				versions h2c 2
+				# HTTP/1.1 only: websocket upgrades cannot travel over h2c (see the note at the top).
+				versions 1.1
 			}
 			# Message delivery holds the socket open indefinitely.
 			flush_interval -1
