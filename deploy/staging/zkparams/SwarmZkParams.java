@@ -27,13 +27,19 @@
  *
  * WHICH CLIENT-FACING NAME EACH SET MAPS TO
  * ---------------------------------------------------------------------------------------
- *   groups          -> the client's `serverPublicParams`        (zkgroup: groups, profiles, auth)
- *   chat            -> the client's `genericServerPublicParams` AND `backupServerPublicParams`
- *                      (in this upstream revision BackupAuthManager is constructed with
- *                      chatGenericZkSecretParams, so the two are the same value; see
- *                      WhisperServerService where backupAuthManager is built)
- *   calling         -> calling credentials, libsignal >= 0.101
- *   callingPreV101  -> calling credentials, older clients
+ *   groups          -> the client's `serverPublicParams`        (zkgroup: groups, profiles, auth,
+ *                      receipts, group send endorsements)
+ *   chat            -> the client's `backupServerPublicParams`  (backup credentials:
+ *                      WhisperServerService builds BackupAuthManager with chatGenericZkSecretParams)
+ *   calling         -> the client's `genericServerPublicParams` (calling credentials, libsignal
+ *                      >= 0.101: the call-link auth credentials CertificateController returns with
+ *                      the group auth credentials, and CallLinkController's create-call-link
+ *                      credentials; Signal-Desktop verifies both with genericServerPublicParams)
+ *   callingPreV101  -> calling credentials for clients older than libsignal 0.101
+ *
+ * Until 2026-09-27 this comment and generate-secrets.sh mapped `chat` to genericServerPublicParams.
+ * The desktop then rejected every call-link credential ("Verification failure in zkgroup"), and
+ * because those arrive in the same response as the group auth credentials, groups failed too.
  */
 
 import java.security.SecureRandom;

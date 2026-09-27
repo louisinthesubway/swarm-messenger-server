@@ -129,10 +129,12 @@ cdn.accessSecret: ${CDN_SECRET}
 
 # zkgroup (ServerSecretParams). Public half is the clients' serverPublicParams.
 groupsZkConfig.serverSecret: ${GROUPS_SECRET}
-# GenericServerSecretParams. Public half is the clients' genericServerPublicParams, and also
-# their backupServerPublicParams in this upstream revision.
+# GenericServerSecretParams for backup credentials (BackupAuthManager). Public half is the
+# clients' backupServerPublicParams.
 chatZkConfig.serverSecret: ${CHAT_SECRET}
-# GenericServerSecretParams for calling credentials.
+# GenericServerSecretParams for calling credentials: call-link auth credentials (returned with the
+# group auth credentials) and create-call-link credentials. Public half is the clients'
+# genericServerPublicParams.
 callingZkConfigV101.serverSecret: ${CALLING_SECRET}
 callingZkConfigPreV101.serverSecret: ${CALLING_PRE_SECRET}
 
@@ -254,7 +256,7 @@ doc = {
         "sfu": None,
     },
     "serverPublicParams": os.environ["ZK_GROUPS_PUBLIC"],
-    "genericServerPublicParams": os.environ["ZK_CHAT_PUBLIC"],
+    "genericServerPublicParams": os.environ["ZK_CALLING_PUBLIC"],
     "backupServerPublicParams": os.environ["ZK_CHAT_PUBLIC"],
     "callingServerPublicParams": os.environ["ZK_CALLING_PUBLIC"],
     "callingServerPublicParamsPreV101": os.environ["ZK_CALLING_PRE_PUBLIC"],
@@ -262,9 +264,12 @@ doc = {
     "registrationCaCertificatePem": ca_pem,
     "comments": {
         "serverPublicParams": "zkgroup ServerPublicParams. Pairs with groupsZkConfig.serverSecret.",
-        "genericServerPublicParams": "GenericServerPublicParams. Pairs with chatZkConfig.serverSecret.",
-        "backupServerPublicParams": "Same value as genericServerPublicParams: in this upstream "
-                                    "revision BackupAuthManager is built with the chat generic params.",
+        "genericServerPublicParams": "GenericServerPublicParams for calling credentials (call-link "
+                                     "auth, create call link). Pairs with callingZkConfig "
+                                     "(callingZkConfigV101.serverSecret); same value as "
+                                     "callingServerPublicParams.",
+        "backupServerPublicParams": "GenericServerPublicParams for backup credentials. Pairs with "
+                                    "chatZkConfig.serverSecret (BackupAuthManager).",
         "serverTrustRoots": "Sealed-sender trust roots, base64 public keys. A list so a future "
                             "rotation can publish the new root alongside the old one.",
         "registrationCaCertificatePem": "The staging stack's INTERNAL CA, for the chat server's "

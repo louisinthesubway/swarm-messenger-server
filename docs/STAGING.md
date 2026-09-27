@@ -228,13 +228,25 @@ per-deployment, not per-repository.
 | Field | What it is | Where it comes from |
 |---|---|---|
 | `serverPublicParams` | libsignal zkgroup `ServerPublicParams`: groups, profile keys, auth credentials | public half of `groupsZkConfig.serverSecret` |
-| `genericServerPublicParams` | libsignal `GenericServerPublicParams` | public half of `chatZkConfig.serverSecret` |
-| `backupServerPublicParams` | the same value as `genericServerPublicParams` in this upstream revision, because `BackupAuthManager` is constructed with the chat generic params. Kept as a separate field because upstream may split them, and then clients need both | public half of `chatZkConfig.serverSecret` |
-| `callingServerPublicParams`, `…PreV101` | calling credentials, current and legacy | public halves of `callingZkConfig` / `callingZkConfigPreV101` |
+| `genericServerPublicParams` | libsignal `GenericServerPublicParams` for **calling** credentials: the call-link auth credentials that `GET /v1/certificate/auth/group?v101=true` returns next to the group auth credentials, and the create-call-link credentials. This is what Signal-Desktop's `genericServerPublicParams` (Android `GENERIC_SERVER_PUBLIC_PARAMS`) verifies. Same value as `callingServerPublicParams` | public half of `callingZkConfig.serverSecret` (`callingZkConfigV101.serverSecret` in the bundle) |
+| `backupServerPublicParams` | libsignal `GenericServerPublicParams` for **backup** credentials (`BackupAuthManager` is built with the chat generic params) | public half of `chatZkConfig.serverSecret` |
+| `callingServerPublicParams`, `…PreV101` | calling credentials, current and legacy (`v101=false`). The current one is repeated under the client's name, `genericServerPublicParams` | public halves of `callingZkConfig` / `callingZkConfigPreV101` |
 | `serverTrustRoots` | sealed-sender trust roots, base64 public keys. A **list**, so a future rotation can publish the new root beside the old one and clients accept both during the overlap | public half of `unidentifiedDelivery.privateKey`; the server's `unidentifiedDelivery.certificate` is signed by it |
 | `registrationCaCertificatePem` | the stack's **internal** CA, used only for the chat server's gRPC hop to the registration stub. **Clients do not need it**; public HTTPS uses Let's Encrypt | `certs/swarm-staging-ca.crt`, also in `.env` as `SWARM_REGISTRATION_CA_PEM` |
 | `endpoints.registration` | `null` on purpose: `reg.chat.swarm.green` is not published | — |
 | `endpoints.sfu` | `null` on purpose: no SFU or TURN server exists | — |
+
+**Correction, 2026-09-27 (Opus M-H).** Until then this table and `generate-secrets.sh` gave
+`genericServerPublicParams` the chat set. Signal's own clients use the chat set only for backups
+(`backupServerPublicParams`); `genericServerPublicParams` is the calling set. With the chat set
+in that slot the desktop rejected every call-link credential (`Verification failure in zkgroup`
+in `CallLinkAuthCredentialResponse.receive`), and since those credentials arrive in the same
+response as the group auth credentials, `groupCredentialFetcher` retried forever and no group
+could be created. No secret was wrong and none changed: a deployment generated before the fix
+corrects its `shared/staging-public-params.json` by copying `callingServerPublicParams` into
+`genericServerPublicParams`, and the clients re-import it (desktop:
+`node scripts/swarm-import-params.mjs`). Upstream Signal-Desktop ships different values for the
+two fields in both of its environments, which is the same split.
 
 The zk parameter sets are **not** interchangeable types. `serverPublicParams` is a zkgroup
 `ServerPublicParams` (900 base64 characters); the other three are `GenericServerPublicParams`
