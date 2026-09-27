@@ -351,41 +351,25 @@ svr2:
     # Upstream's published self-signed test certificate, from
     # service/src/test/resources/config/test.yml. It is not a secret and it is not trusted by
     # anything: it exists so the block parses. Anchored here and aliased below.
-    - &placeholderCertificate |
-      -----BEGIN CERTIFICATE-----
-      MIIDazCCAlOgAwIBAgIUW5lcNWkuynRVc8Rq5pO6mHQBuZAwDQYJKoZIhvcNAQEL
-      BQAwRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM
-      GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yNDAzMjUwMzE4MTNaFw0yOTAz
-      MjQwMzE4MTNaMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw
-      HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggEiMA0GCSqGSIb3DQEB
-      AQUAA4IBDwAwggEKAoIBAQCfH4Um+fv2r4KudhD37/UXp8duRLTmp4XvpBTpDHpD
-      2HF8p2yThVKlJnMkP/9Ey1Rb0vhxO7DCltLdW8IYcxJuHoyMvyhGUEtxxkOZbrk8
-      ciUR9jTZ37x7vXRGj/RxcdlS6iD0MeF0D/LAkImt4T/kiKwDbENrVEnYWJmipCKP
-      ribxWky7HqxDCoYMQr0zatxB3A9mx5stH+H3kbw3CZcm+ugF9ZIKDEVHb0lf28gq
-      llmD120q/vs9YV3rzVL7sBGDqf6olkulvHQJKElZg2rdcHWFcngSlU2BjR04oyuH
-      c/SSiLSB3YB0tdFGta5uorXyV1y7RElPeBfOfvEjsG3TAgMBAAGjUzBRMB0GA1Ud
-      DgQWBBQX+xlgSWWbDjv0SrJ+h67xauJ80zAfBgNVHSMEGDAWgBQX+xlgSWWbDjv0
-      SrJ+h67xauJ80zAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQAw
-      ZG2MCCjscn6h/QOoJU+IDfa68OqLq0I37gMnLMde4yEhAmm//miePIq4Uz9GRJ+h
-      rAmdEnspKgyQ93PjF7Xpk/JdJA4B1bIrsOl/cSwqx2sFhRt8Kt1DHGlGWXqOaHRP
-      UkZ86MyRL3sXly6WkxEYxZJeQaOzMy2XmQh7grzrlTBuSI+0xf7vsRRDipxr6LVQ
-      6qGWyGODLLc2JD1IXj/1HpRVT2LoGGlKMuyxACQAm4oak1vvJ9mGxgfd9AU+eo58
-      O/esB2Eaf+QqMPELdFSZQfG2jvp+3WQTZK8fDKHyLr076G3UetEMy867F6fzTSZd
-      9Kxq0DY7RCEpdHMCKcOL
-      -----END CERTIFICATE-----
+    # 2026-09-27: a YAML alias to a block-scalar certificate reached the server as EMPTY text
+    # ("Could not parse certificate: Empty input", then "No certificate data found"), so every
+    # place that used the placeholder alias now carries the staging CA through the same
+    # substitution that already works for registrationCaCertificate. None of these services
+    # is reachable; the certificate only has to parse.
+    - "${SWARM_REGISTRATION_CA_PEM}"
 
 svrb:
   uri: svrb.disabled.swarm.invalid
   userAuthenticationTokenSharedSecret: secret://svrb.userAuthenticationTokenSharedSecret
   userIdTokenSharedSecret: secret://svrb.userIdTokenSharedSecret
   svrCaCertificates:
-    - *placeholderCertificate
+    - "${SWARM_REGISTRATION_CA_PEM}"
 
 storageService:
   uri: storage.disabled.swarm.invalid
   userAuthenticationTokenSharedSecret: secret://storageService.userAuthenticationTokenSharedSecret
   storageCaCertificates:
-    - *placeholderCertificate
+    - "${SWARM_REGISTRATION_CA_PEM}"
 
 keyTransparencyService:
   host: kt.disabled.swarm.invalid
