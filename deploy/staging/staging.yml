@@ -390,8 +390,13 @@ storageService:
 keyTransparencyService:
   host: kt.disabled.swarm.invalid
   port: 443
-  tlsCertificate: *placeholderCertificate
-  clientCertificate: *placeholderCertificate
+  # 2026-09-27, first real host: KeyTransparencyServiceClient parses clientCertificate with
+  # CertificateFactory at startup and the YAML alias arrived as something it could not read
+  # ("No certificate data found"), so the server never started. The staging CA is a real
+  # certificate the same substitution already delivers to registrationCaCertificate. The
+  # service stays unreachable (kt.disabled.swarm.invalid); nothing is ever sent to it.
+  tlsCertificate: "${SWARM_REGISTRATION_CA_PEM}"
+  clientCertificate: "${SWARM_REGISTRATION_CA_PEM}"
   clientPrivateKey: secret://keyTransparencyService.clientPrivateKey
 
 # ---------------------------------------------------------------------------- disabled: push
