@@ -23,7 +23,7 @@ upstream source.
 
 ---
 
-## 1. Code changes (2)
+## 1. Code changes (6)
 
 ### 1.1 `DynamoDbClientConfiguration`: optional `endpointOverride`
 
@@ -90,6 +90,29 @@ Caddyfile answers `reg.chat.swarm.green` with a 404 rather than proxying it. The
 `default` type is untouched and remains the only option for a real deployment.
 
 ---
+
+### 1.3 Wallet sign-in: four small edits, one new package
+
+Added 2026-09-27 on the owner's decision, *"instead of a phone number make the users sign in with our
+wallet."* `docs/WALLET-SIGN-IN.md` is the full account - the protocol, the derivation, why `+888`, what
+it is safe against, what phase 2 removes. The upstream files touched:
+
+| File | Change |
+|---|---|
+| `controllers/RegistrationController.java` | a SWARM account identifier may only be registered by the identity key that derives it (403), and an existing SWARM account may not be handed to a different key (409). Two guards, both no-ops for an ordinary phone number |
+| `controllers/VerificationController.java` | `POST /v1/verification/session` refuses a SWARM identifier (400): no SMS or call can ever reach one |
+| `limits/RateLimiters.java` | `swarmWalletChallenge` (20/minute, by IP) and `swarmWalletVerify` (6/minute) |
+| `WhisperServerService.java` | constructs and registers the new controller; the two-minute challenge TTL |
+
+and the new package `service/src/main/java/org/whispersystems/textsecuregcm/swarm/`:
+`SwarmWalletIdentity` (the derivations and the checks, pure functions),
+`SwarmWalletChallengeStore` (pending challenges in the rate-limiters Redis, `SET … EX` / `GETDEL`),
+`SwarmWalletRegistrationController` (`POST /v1/swarm/registration/challenge` and `/verify`), four DTOs
+and one exception. Tests: `SwarmWalletIdentityTest` (23) and `SwarmWalletRegistrationControllerTest`
+(10).
+
+**No new table and no new configuration key**, so deploying this is rebuilding the image and
+restarting the chat container. Nothing in `deploy/staging/` changed.
 
 ## 2. Additions (no upstream file changed)
 
