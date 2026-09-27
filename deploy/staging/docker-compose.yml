@@ -326,6 +326,11 @@ services:
         condition: service_healthy
       registration-stub:
         condition: service_started
+    # staging.yml resolves ${SWARM_*} INSIDE the container (Dropwizard substitution), so the
+    # whole .env must reach the process, not only the compose file. 2026-09-27: without this
+    # the server died on 'Cannot resolve variable SWARM_REGISTRATION_CA_PEM'.
+    env_file:
+      - .env
     environment:
       # The staging registration channel carries no identity token; the server refuses to
       # start with `registrationService.type: swarm-staging` unless this is exactly "true".
