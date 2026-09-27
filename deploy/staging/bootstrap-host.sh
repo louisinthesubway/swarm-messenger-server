@@ -9,7 +9,7 @@
 #   sudo SWARM_ACME_EMAIL=you@example.com ./deploy/staging/bootstrap-host.sh
 #
 # What it does, in order:
-#   1. sanity-checks the host (Ubuntu 24.04, x86-64, RAM, disk, DNS)
+#   1. sanity-checks the host (Ubuntu 24.04 or 26.04, x86-64, RAM, disk, DNS)
 #   2. installs Docker Engine + the compose plugin from Docker's own apt repository
 #   3. installs a JDK 26 (Temurin) and git
 #   4. clones or updates Swarm-Official/swarm-messenger-server at a PINNED commit
@@ -127,7 +127,7 @@ fi
 log "3/9  installing a JDK ${SWARM_JDK_VERSION}, git and openssl"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y -qq git openssl python3 jq >/dev/null
+apt-get install -y -qq git openssl python3 jq unzip >/dev/null  # unzip: without it mvnw fetches the .tar.gz and fails the .zip checksum
 
 if java -version 2>&1 | grep -qE "\"${SWARM_JDK_VERSION}\\."; then
   info "already present: $(java -version 2>&1 | head -1)"
