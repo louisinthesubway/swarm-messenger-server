@@ -225,17 +225,20 @@ services:
   # resolve to this container, so no code change is needed to force path-style addressing.
   minio:
     <<: *restart
-    # Current MinIO releases no longer ship the web console; administration is through `mc`
-    # (the minio-bootstrap service). That is why no --console-address is passed.
-    image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+    # 2026-09-27: MinIO's own images (minio/minio, minio/mc) are gone from Docker Hub and
+    # Quay at every tag. The frozen Bitnami legacy image still pulls and ships both the
+    # server and the `mc` client (MinIO DEVELOPMENT.2025-05-24, mc 2025-05-21), so it serves
+    # both this service and minio-bootstrap. It runs as uid 1001 with its data directory at
+    # /bitnami/minio/data and its own entrypoint, which honours MINIO_ROOT_USER/PASSWORD and
+    # listens on 9000 (API) and 9001 (console).
+    image: docker.io/bitnamilegacy/minio:latest@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
     hostname: minio
-    command: ["server", "/data"]
     environment:
       MINIO_ROOT_USER: ${SWARM_MINIO_ROOT_USER:-swarmstaging}
       MINIO_ROOT_PASSWORD: ${SWARM_MINIO_ROOT_PASSWORD:?set SWARM_MINIO_ROOT_PASSWORD in .env}
       MINIO_DOMAIN: minio.swarm.local
     volumes:
-      - minio-data:/data
+      - minio-data:/bitnami/minio/data
     networks:
       swarm:
         aliases:
@@ -247,7 +250,8 @@ services:
     # and waits for readiness there, and `chat` waits for that one-shot to finish.
 
   minio-bootstrap:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # Same image as `minio`: it carries `mc` on PATH (see the note there).
+    image: docker.io/bitnamilegacy/minio:latest@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
     restart: "no"
     depends_on:
       minio:
