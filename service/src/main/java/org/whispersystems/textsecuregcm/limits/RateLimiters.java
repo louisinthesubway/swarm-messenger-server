@@ -65,7 +65,12 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     CREATE_DONATION_PERMIT("createDonationCredential", new RateLimiterConfig(30, Duration.ofHours(4), true)),
     ONE_TIME_DONATION("oneTimeDonation", new RateLimiterConfig(5, Duration.ofMinutes(1), true)),
     ADD_SUBSCRIPTION_PAYMENT_METHOD("addSubscriptionPaymentMethod", new RateLimiterConfig(10, Duration.ofMinutes(1), true)),
-    CHECK_MFA("checkMfa", new RateLimiterConfig(50, Duration.ofHours(12), false))
+    CHECK_MFA("checkMfa", new RateLimiterConfig(50, Duration.ofHours(12), false)),
+
+    // SWARM addition: the wallet sign-in channel. Asking for a challenge is cheap and a client may
+    // retry a few times; answering one is the half that does work and is held tighter.
+    SWARM_WALLET_CHALLENGE("swarmWalletChallenge", new RateLimiterConfig(20, Duration.ofMinutes(1), true)),
+    SWARM_WALLET_VERIFY("swarmWalletVerify", new RateLimiterConfig(6, Duration.ofMinutes(1), false))
     ;
 
     private final String id;

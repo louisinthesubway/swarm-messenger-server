@@ -81,6 +81,8 @@ import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.ReceiptAlreadyRedeemedException;
 import org.whispersystems.textsecuregcm.subscriptions.ReceiptCredentialPresentationFactory;
+import org.whispersystems.textsecuregcm.swarm.MismatchedSwarmWalletIdentityException;
+import org.whispersystems.textsecuregcm.swarm.SwarmWalletIdentity;
 import org.whispersystems.textsecuregcm.subscriptions.ReceiptLevel;
 import org.whispersystems.textsecuregcm.util.HeaderUtils;
 import org.whispersystems.textsecuregcm.util.Util;
@@ -235,6 +237,16 @@ public class RegistrationController {
       throw new WebApplicationException("PNI keys and registration ID must be provided", 422);
     }
 
+    // SWARM addition (wallet sign-in): a SWARM account identifier is derived from the account's own
+    // ACI identity key, so it may only be registered by a request carrying that key. This is the
+    // stateless half of the check the registration password cannot give us; see SwarmWalletIdentity
+    // and docs/WALLET-SIGN-IN.md. It is a no-op for every ordinary phone number.
+    try {
+      SwarmWalletIdentity.requireIdentityMatchesNumber(number, registrationRequest.aciIdentityKey());
+    } catch (final MismatchedSwarmWalletIdentityException e) {
+      throw new ForbiddenException(e.getMessage());
+    }
+
     final PhoneVerificationRequest.VerificationType verificationType;
     try {
       verificationType = phoneVerificationTokenManager.verify(
@@ -264,6 +276,19 @@ public class RegistrationController {
         .filter(Optional::isPresent)
         .map(Optional::get)
         .findFirst();
+
+    // SWARM addition (wallet sign-in): re-registering a phone number is how a person moves their
+    // account to a new device, and the number is proof enough because a carrier issued it. A SWARM
+    // identifier is derived instead, so two different wallets can - rarely - derive the same one. In
+    // that case this is not a re-registration: it is a second wallet asking for the first wallet's
+    // account. Refuse, and let the client say so.
+    if (SwarmWalletIdentity.isSwarmWalletNumber(number)
+        && existingAccount.isPresent()
+        && !registrationRequest.aciIdentityKey().equals(existingAccount.get().getAccountIdentityKey())) {
+
+      throw new WebApplicationException(
+          Response.status(409, "account identifier belongs to a different identity key").build());
+    }
 
     existingAccount.ifPresent(account -> {
       final Instant accountLastSeen = Instant.ofEpochMilli(account.getLastSeen());

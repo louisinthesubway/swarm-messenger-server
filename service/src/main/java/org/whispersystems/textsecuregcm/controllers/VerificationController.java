@@ -96,6 +96,7 @@ import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberIdentifiers;
 import org.whispersystems.textsecuregcm.storage.PhoneNumberRecoveryPasswordsManager;
 import org.whispersystems.textsecuregcm.storage.VerificationSessionManager;
+import org.whispersystems.textsecuregcm.swarm.SwarmWalletIdentity;
 import org.whispersystems.textsecuregcm.telephony.CarrierData;
 import org.whispersystems.textsecuregcm.telephony.CarrierDataException;
 import org.whispersystems.textsecuregcm.telephony.CarrierDataProvider;
@@ -187,6 +188,13 @@ public class VerificationController {
   public VerificationSessionResponse createSession(@NotNull @Valid final CreateVerificationSessionRequest request,
       @Context final ContainerRequestContext requestContext)
       throws RateLimitExceededException, ObsoletePhoneNumberFormatException {
+
+    // SWARM addition (wallet sign-in): a SWARM account identifier is not a telephone number, and no
+    // SMS or call can ever reach it. Refuse it here instead of letting a client wait for a code that
+    // cannot arrive; those accounts register through /v1/swarm/registration.
+    if (SwarmWalletIdentity.isSwarmWalletNumber(request.number())) {
+      throw new BadRequestException("SWARM account identifiers do not verify by SMS or call");
+    }
 
     final Pair<String, PushNotification.TokenType> pushTokenAndType = validateAndExtractPushToken(
         request.updateVerificationSessionRequest());

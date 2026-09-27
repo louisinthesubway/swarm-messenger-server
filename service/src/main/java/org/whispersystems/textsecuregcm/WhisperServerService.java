@@ -296,6 +296,8 @@ import org.whispersystems.textsecuregcm.storage.VerificationSessions;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckManager;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceCheckTrustAnchor;
 import org.whispersystems.textsecuregcm.storage.devicecheck.AppleDeviceChecks;
+import org.whispersystems.textsecuregcm.swarm.SwarmWalletChallengeStore;
+import org.whispersystems.textsecuregcm.swarm.SwarmWalletRegistrationController;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FaultTolerantDatabase;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDbMessageStore;
 import org.whispersystems.textsecuregcm.storage.foundationdb.FoundationDBWarmup;
@@ -367,6 +369,14 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
   private static final Logger log = LoggerFactory.getLogger(WhisperServerService.class);
 
   public static final String SECRETS_BUNDLE_FILE_NAME_PROPERTY = "secrets.bundle.filename";
+
+  /**
+   * SWARM addition: how long a wallet registration challenge stays answerable. Long enough for a
+   * person to unlock a wallet and for the round trip, short enough that an abandoned challenge is
+   * gone before anyone could come back to it. Not configurable on purpose - there is no deployment
+   * for which a different number is right, and a config key is a thing that can be set wrong.
+   */
+  private static final Duration SWARM_WALLET_CHALLENGE_TTL = Duration.ofMinutes(2);
 
   @Override
   public void initialize(final Bootstrap<WhisperServerConfiguration> bootstrap) {
@@ -1315,6 +1325,10 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new ProvisioningController(rateLimiters, provisioningManager),
         new RegistrationController(accountsManager, phoneVerificationTokenManager, registrationLockVerificationManager,
             rateLimiters, registrationFraudChecker, ReceiptCredentialPresentation::new, zkReceiptOperations, clock, dynamicConfigurationManager),
+        // SWARM addition: registration by wallet identity key instead of a telephone number.
+        new SwarmWalletRegistrationController(
+            new SwarmWalletChallengeStore(rateLimitersCluster, SWARM_WALLET_CHALLENGE_TTL),
+            phoneNumberIdentifiers, phoneNumberRecoveryPasswordsManager, accountsManager, rateLimiters),
         new RemoteConfigController(remoteConfigsManager),
         new SecureStorageController(storageCredentialsGenerator),
         new SecureValueRecovery2Controller(svr2CredentialsGenerator, accountsManager),
