@@ -274,6 +274,120 @@ ordinary HTTP tooling in the meantime, which is what the walk-through in section
 
 ---
 
+## 5b. gRPC / HTTP/2 — what libsignal's "H2 connection" is
+
+Written 2026-09-27 by Opus M-H, from the code, **before** the edge was changed. The status of
+each step is at the end of this section.
+
+The desktop panicked with `AuthenticatedChatConnection_reserve_username_hash: requires an H2
+connection` when a user set a username. This section records what that connection is on both
+sides, and what the staging edge has to do to carry it.
+
+### The client: libsignal 0.101.2 (`rust/net`)
+
+The chat route has an HTTP version (`ConnectionConfig.http_version` in `rust/net/src/env.rs`).
+With `Http1_1` the chat websocket is an ordinary HTTP/1.1 `Upgrade` and **no HTTP/2 connection
+exists**. With `Http2`:
+
+* **Same host, same port.** TLS to the chat host (`chat.swarm.green:443`), minimum TLS 1.3, ALPN
+  offering exactly `h2` — there is no HTTP/1.1 fallback on that route
+  (`rust/net/infra/src/route/http.rs`).
+* **The websocket is an RFC 8441 extended CONNECT**: `:method CONNECT`, `:protocol websocket`,
+  `:path /v1/websocket/` (or `/v1/websocket/provisioning/`), `sec-websocket-version: 13`, plus the
+  headers the HTTP/1.1 handshake carries (`Authorization: Basic {aci}.{deviceId}:{password}` on
+  the authenticated socket, `User-Agent`, `Accept-Language`, `X-Signal-Receive-Stories`). Any 2xx
+  answer opens it (`connect_http2` in `rust/net/infra/src/ws.rs`). The server must advertise
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`, or the request is refused.
+* **gRPC rides the same HTTP/2 connection.** libsignal keeps it next to the websocket stream
+  (`shared_h2_connection`) and sends plain gRPC on it:
+  `POST /org.signal.chat.<package>.<Service>/<Method>`, `content-type: application/grpc`,
+  `te: trailers`, authority = the chat host, no path prefix. Every gRPC request carries the
+  websocket's headers except `X-Signal-Receive-Stories` (`start_connect_with_transport` in
+  `rust/net/src/chat.rs`): calls on the authenticated socket authenticate with the same Basic
+  credentials, calls on the unauthenticated socket carry none.
+* **gRPC-only calls.** In 0.101.2 these exist *only* over gRPC (`require_grpc` in
+  `rust/bridge/shared/src/net/chat.rs`) and panic without an H2 connection: username reserve /
+  confirm / delete, username link set / delete, device name, remove device, list devices,
+  registration lock, registration recovery password, phone-number discoverability, push token,
+  all backup calls, the call-quality survey and backup-receipt redemption. Everything else
+  (messages, keys, profiles, username *lookup*) uses the websocket unless the server's remote
+  config switches a call to gRPC (`grpc.*` keys, `chat_grpc_overrides`).
+* **Upstream production** (`DOMAIN_CONFIG_CHAT`): host `grpc.chat.signal.org`, TLS 1.3 minimum,
+  `Http2`, confirmation header `x-signal-timestamp`, plus domain-fronting proxies that use
+  HTTP/1.1 (SWARM has none).
+
+### The server: `OmnibusH2Server` (the `grpc:` block, port 50051)
+
+* A Netty HTTP/2 server. TLS with SNI from `tlsKeyStore`, or — with `grpc.h2c: true`, as on
+  staging — cleartext h2c with prior knowledge. It accepts an optional PROXY protocol v1/v2
+  header and sets `x-forwarded-for` from it (from the TCP peer otherwise); upstream expects a
+  PPv2 load balancer in front (comment in `RequestAttributesInterceptor`). It advertises
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
+* It routes each HTTP/2 stream by its exact `:path`: `/v1/websocket/` and
+  `/v1/websocket/provisioning/` are forwarded frame by frame to
+  `grpc.websocketAddress:websocketPort` (Jetty's h2c connector on 8080); **every other path goes
+  to the in-process gRPC server** (Netty `LocalAddress("grpc")`). There is no other network entry
+  to gRPC.
+* Authentication is per service: Accounts, Calling, Credentials, Keys, Profile, Messages,
+  Backups, Devices, Attachments, Payments, Challenge, Donations, ProductConfiguration and
+  RemoteConfiguration require `Authorization: Basic` (the same account authenticator as REST and
+  the websocket); the `*Anonymous` services, CallQualitySurvey, KeyTransparency, LoginPurchase,
+  Subscriptions and OneTimeDonations reject any `Authorization` header.
+* `GrpcAllowListInterceptor` answers `UNIMPLEMENTED` unless the dynamic configuration allows the
+  call. Staging's `minio/dynamic-config.yaml` sets `grpcAllowList.enableAll: true`.
+* Staging: `bindAddress 0.0.0.0`, `port 50051`, `websocketAddress localhost`,
+  `websocketPort 8080`, `h2c: true`, published on the host as `127.0.0.1:50051` only. Checked on
+  the host at 2026-09-27 18:0x UTC with `curl --http2-prior-knowledge`:
+  `AccountsAnonymous/CheckAccountExistence` with an empty message answers `grpc-status: 3`
+  ("invalid service identifier"), `Accounts/ReserveUsernameHash` without credentials answers
+  `grpc-status: 16` ("missing authorization header").
+
+### The edge before the change
+
+* Caddy v2.10.2 (built with Go 1.25.0) negotiates `h2` over TLS 1.3 but advertises
+  `ENABLE_CONNECT_PROTOCOL = 0`: Go's HTTP/2 server switches RFC 8441 off unless the process runs
+  with `GODEBUG=http2xconnect=1` (golang/go#71128). An extended CONNECT is reset with
+  `PROTOCOL_ERROR`, so a libsignal build that selects `Http2` could not open its websocket at
+  all, and would lose the whole chat connection.
+* `application/grpc` requests fell through to `chat:8080` (Jetty REST) and got HTTP 404.
+
+### The change
+
+1. **Caddy runs with `GODEBUG=http2xconnect=1`** (`docker-compose.yml`, service `caddy`). Caddy
+   2.10's `reverse_proxy` already turns an HTTP/2 extended-CONNECT websocket into an HTTP/1.1
+   upgrade toward the upstream (`h2_websocket_body` in `reverseproxy.go` / `streaming.go`), so
+   the existing `@websocket` route (HTTP/1.1 to `chat:8080`) serves HTTP/1.1 clients (libsignal
+   up to `0.101.2-swarm.1`) and HTTP/2 clients (`0.101.2-swarm.2` and later) alike. The
+   `x-signal-timestamp` header of Jetty's `101` is copied onto the HTTP/2 `200`.
+2. **A `@grpc` route** (`protocol grpc`, i.e. `Content-Type: application/grpc…`) proxies to
+   `chat:50051` over h2c with `proxy_protocol v2`, so the omnibus sees the client's address the
+   way upstream intends instead of Caddy's. PROXY protocol makes Caddy open one upstream
+   connection per request (Caddy turns keep-alive off for it); that is fine at staging volume.
+   The omnibus hands the request to the in-process gRPC server; authentication is unchanged.
+3. Nothing new is published: `50051` stays bound to `127.0.0.1` on the host, and Caddy reaches
+   it over the compose network.
+4. **Client:** the `swarm-libsignal` fork sets `http_version: Some(HttpVersion::Http2)` for
+   `DOMAIN_CONFIG_CHAT_SWARM` (TLS 1.3 minimum and the `x-signal-timestamp` confirmation header
+   stay), released as `swarm-libsignal-0.101.2-swarm.2`.
+
+Considered and rejected: publishing the omnibus directly (`h2c: false`, TLS in the JVM). It needs
+a second public port or host name, a PKCS#12 keystore and its renewals, while libsignal dials
+exactly one chat host.
+
+Consequences to know:
+
+* A client that selects `Http2` has **no fallback**. If the edge stops advertising extended
+  CONNECT (for example Caddy recreated without the `GODEBUG` setting), such a client cannot
+  connect at all. Check with any HTTP/2 client that prints the peer's settings
+  (`enableConnectProtocol` must be `true`).
+* Browsers may now also open WebSockets over HTTP/2 to `chat.swarm.green`; Caddy converts those
+  the same way.
+
+Status: **proposed** at the time of writing; the Live Log in the project vault ("Opus M-H
+discovery") records when each step was implemented and what was tested.
+
+---
+
 ## 6. Start order
 
 Compose enforces this with `depends_on` conditions, but know it for debugging:
