@@ -4,7 +4,7 @@
 #
 #   FoundationDB   messages          foundationdb/foundationdb (single, ssd)
 #   DynamoDB       accounts/keys/... amazon/dynamodb-local
-#   Redis clusters cache/rate/...    bitnamilegacy/redis-cluster (one single-node cluster per role)
+#   Redis clusters cache/rate/...    redis:7.4-alpine, one single-node cluster per role (redis/single-node-cluster.sh)
 #   Redis          pubsub            redis (standalone)
 #   S3             CDN + paged PQ    minio
 #   Registration   SMS verification  ./registration-stub (fixed code, staging only)
@@ -128,18 +128,24 @@ services:
   # Each is a single-node cluster owning all 16384 slots — the smallest thing that is still
   # a real cluster. Static IPs are used because a Redis cluster announces the address it
   # believes it has, and the chat server connects to whatever it announces.
+  # ---------------------------------------------------------------- Redis "clusters"
+  # The chat server uses Lettuce's CLUSTER client for these four, so each must be a Redis
+  # Cluster. 2026-09-27: the Bitnami cluster creator refuses fewer than three masters
+  # ("Redis Cluster requires at least 3 master nodes"), so each is now ONE stock Redis node in
+  # cluster mode that assigns all 16384 slots to itself (redis/single-node-cluster.sh). Fixed
+  # addresses because a cluster node announces its IP to clients. Only the messages cache
+  # persists to its volume; the others are pure caches.
   redis-cache:
     <<: *restart
-    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     hostname: redis-cache
     environment:
-      ALLOW_EMPTY_PASSWORD: "yes"
-      REDIS_CLUSTER_REPLICAS: "0"
-      REDIS_NODES: "10.77.0.21"
-      REDIS_CLUSTER_CREATOR: "yes"
-      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.21"
+      REDIS_ANNOUNCE_IP: "10.77.0.21"
+      REDIS_PERSIST: "no"
     volumes:
-      - redis-cache-data:/bitnami/redis/data
+      - redis-cache-data:/data
+      - ./redis/single-node-cluster.sh:/single-node-cluster.sh:ro
+    entrypoint: ["/bin/sh", "/single-node-cluster.sh"]
     networks:
       swarm:
         ipv4_address: 10.77.0.21
@@ -148,20 +154,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 40
-      start_period: 15s
+      start_period: 10s
 
   redis-pushscheduler:
     <<: *restart
-    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     hostname: redis-pushscheduler
     environment:
-      ALLOW_EMPTY_PASSWORD: "yes"
-      REDIS_CLUSTER_REPLICAS: "0"
-      REDIS_NODES: "10.77.0.22"
-      REDIS_CLUSTER_CREATOR: "yes"
-      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.22"
+      REDIS_ANNOUNCE_IP: "10.77.0.22"
+      REDIS_PERSIST: "no"
     volumes:
-      - redis-pushscheduler-data:/bitnami/redis/data
+      - redis-pushscheduler-data:/data
+      - ./redis/single-node-cluster.sh:/single-node-cluster.sh:ro
+    entrypoint: ["/bin/sh", "/single-node-cluster.sh"]
     networks:
       swarm:
         ipv4_address: 10.77.0.22
@@ -169,42 +174,36 @@ services:
 
   redis-ratelimiters:
     <<: *restart
-    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     hostname: redis-ratelimiters
     environment:
-      ALLOW_EMPTY_PASSWORD: "yes"
-      REDIS_CLUSTER_REPLICAS: "0"
-      REDIS_NODES: "10.77.0.23"
-      REDIS_CLUSTER_CREATOR: "yes"
-      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.23"
+      REDIS_ANNOUNCE_IP: "10.77.0.23"
+      REDIS_PERSIST: "no"
     volumes:
-      - redis-ratelimiters-data:/bitnami/redis/data
+      - redis-ratelimiters-data:/data
+      - ./redis/single-node-cluster.sh:/single-node-cluster.sh:ro
+    entrypoint: ["/bin/sh", "/single-node-cluster.sh"]
     networks:
       swarm:
         ipv4_address: 10.77.0.23
     healthcheck: *redis-cluster-health
 
-  # Message cache. Holds undelivered messages until they are persisted to FoundationDB,
-  # so it is the one Redis whose loss costs undelivered traffic.
   redis-messages:
     <<: *restart
-    image: docker.io/bitnamilegacy/redis-cluster:7.4.3@sha256:a53d023fdfaf8a8d7ddc58da040d3494e4cb45772644618ffa44c42dcd32b9af
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     hostname: redis-messages
     environment:
-      ALLOW_EMPTY_PASSWORD: "yes"
-      REDIS_CLUSTER_REPLICAS: "0"
-      REDIS_NODES: "10.77.0.24"
-      REDIS_CLUSTER_CREATOR: "yes"
-      REDIS_CLUSTER_ANNOUNCE_IP: "10.77.0.24"
+      REDIS_ANNOUNCE_IP: "10.77.0.24"
+      REDIS_PERSIST: "yes"
     volumes:
-      - redis-messages-data:/bitnami/redis/data
+      - redis-messages-data:/data
+      - ./redis/single-node-cluster.sh:/single-node-cluster.sh:ro
+    entrypoint: ["/bin/sh", "/single-node-cluster.sh"]
     networks:
       swarm:
         ipv4_address: 10.77.0.24
     healthcheck: *redis-cluster-health
 
-  # Standalone (non-cluster) Redis: the `pubsub` block is a FaultTolerantRedisClient,
-  # not a cluster client.
   redis-pubsub:
     <<: *restart
     image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99

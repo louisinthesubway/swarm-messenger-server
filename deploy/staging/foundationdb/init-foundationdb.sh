@@ -22,12 +22,18 @@ fi
 
 echo "[fdb-init] cluster file: $(cat "${CLUSTER_FILE}")"
 
-echo "[fdb-init] waiting for a coordinator to answer"
-for _ in $(seq 1 60); do
-  if fdbcli --exec "status minimal" --timeout 5 2>&1 | grep -qE "available|unavailable"; then
+# 2026-09-27, first real host: on a brand-new cluster "status" does not answer at all
+# (fdbcli sits in "Long delay" until its timeout) because the cluster loops in recovery
+# waiting for a configuration, so waiting for status before configuring never ends.
+# Configure first; a later run answers "Database already exists", which is fine.
+echo "[fdb-init] configuring the database if it does not exist yet: configure new single ssd"
+for _ in $(seq 1 5); do
+  out="$(fdbcli --exec "configure new single ssd" --timeout 60 2>&1 || true)"
+  echo "[fdb-init] ${out}" | tail -3
+  if echo "${out}" | grep -qiE "Database created|already exists"; then
     break
   fi
-  sleep 2
+  sleep 5
 done
 
 if fdbcli --exec "status minimal" --timeout 10 2>&1 | grep -q "The database is available"; then
