@@ -562,9 +562,10 @@ demonstrably boots a server with them (`./mvnw integration-test -Ptest-server`).
 
 ## 8a. Attachments and avatars
 
-Contract written 2026-09-27 (Opus M-J) from this revision's code and the desktop client's, before
-the implementation. What is implemented and what was tested on the host is recorded at the end
-of this section and in the vault Live Log.
+Status 2026-09-27 (Opus M-J): **implemented and live on the staging host** (swarm-main
+`1ed47927f`; CDN3 switched on at 19:26 UTC) and **tested** with real desktop clients: photos, files
+and profile photos, both directions. What was tested is at the end of this section. The contract
+below was written from this revision's code and the desktop client's before the implementation.
 
 Every byte that reaches the CDN is **ciphertext**. The client encrypts an attachment with a
 random per-attachment key (AES-256-CBC + HMAC-SHA256) that travels only inside the end-to-end
@@ -741,11 +742,15 @@ this revision:
 ```sh
 ./tus/make-tus-env.sh                 # once: writes tus.env (mode 600), prints no secret
 docker compose build tus
-docker compose up minio-bootstrap     # the tus MinIO user, the anonymous read policy, and the
-                                      # re-upload of minio/dynamic-config.yaml (cdn3 on)
-docker compose up -d --no-deps tus    # healthy within ~20 s: docker compose ps tus
+docker compose up --no-deps minio-bootstrap   # the tus MinIO user, the anonymous read policy,
+                                              # and the re-upload of minio/dynamic-config.yaml
+docker compose up -d --no-deps tus            # healthy within ~20 s: docker compose ps tus
 docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
 ```
+
+`caddy/Caddyfile` is bind-mounted as a single file, which Docker binds by inode: change it **in
+place** (`cat new > caddy/Caddyfile`). A tool that writes a new file and renames it leaves the
+container reading the old one, and `caddy reload` then reloads the old configuration.
 
 No chat restart: `staging.yml` does not change, and the server re-reads the dynamic configuration
 every 30 s (`dynamicConfig.refreshInterval`). `--no-deps` keeps compose from touching anything the
@@ -771,6 +776,39 @@ four characters of the key, status, bytes, time), never a header.
   clients retry with new forms.
 - **Unfinished uploads** live in the volume `tus-data` and are deleted 7 days after they started.
   Losing the volume loses only unfinished uploads.
+
+### Tested on 64.95.11.180, 2026-09-27
+
+Step by step, with the log lines, in the vault Live Log (entries "Opus M-J attachments").
+
+- **Edge**, from outside: `OPTIONS /upload/attachments` 204 with `Tus-Version: 1.0.0`; a POST
+  without `Tus-Resumable` 412, without a token 401, with Basic credentials 400; PUT, DELETE and a
+  bucket listing 404; a missing object 404 instead of MinIO's 403.
+- **TUS through the edge** with a token made like `JwtGenerator`'s: creation-with-upload of 3,872
+  chunked bytes 201, HEAD 200 with the full offset, `GET /attachments/<key>` 200 with
+  `Content-Length` and identical bytes, `Range` 206; the resume path (creation, PATCH 123,456
+  bytes, HEAD, PATCH at a wrong offset 409, PATCH the rest 204) stored 300,000 identical bytes; a
+  token for another key 401, `Upload-Length` above `maxLen` 413, a forged signature 401.
+- **Avatar form through the edge**, built like `PostPolicyGenerator`'s and sent like the desktop's:
+  POST 204, `GET /profiles/<name>` 200 with identical bytes; the same form for a key the policy
+  does not name 403.
+- **Desktop clients** (swarm-messenger `b6a1c821c`, libsignal 0.101.2-swarm.1): a 127,888-byte
+  attachment that had been stuck since 17:41 UTC went out at 19:29 UTC, seconds after CDN3 was
+  switched on, and the other side downloaded it; two fresh accounts then exchanged a photo (A to
+  B) and a `.txt` file (B to A), both delivered and shown, and A's profile photo, uploaded at
+  sign-up (`POST https://cdn.chat.swarm.green/` 204), appeared on B once B accepted the message
+  request.
+
+Not covered, or not working:
+
+- **Stickers.** The desktop asks `cdn.chat.swarm.green/stickers/<pack>/manifest.proto` for
+  Signal's default sticker packs; they are not hosted here, so that answers 404.
+- **Backups (CDN3 `backups`)** are not served: only the `attachments` namespace exists.
+- **Voice notes and videos** use the same upload path but were not tried.
+- **One upload service, one disk.** Fine for staging; for more it needs shared staging storage
+  or S3 multipart like Signal's tus-server.
+- A client-side oddity, not the server: once, a received file kept its spinner in a chat that was
+  open when it arrived, although the download had finished; reopening the app showed it.
 
 ---
 
