@@ -925,6 +925,8 @@ lose it and re-register the test accounts.
 | DynamoDB `ResourceNotFoundException` naming a `swarm_*` table | the bootstrap one-shot did not finish | `docker compose up dynamodb-bootstrap` and read its output |
 | Caddy cannot get a certificate | DNS does not point here yet, or 80/443 are blocked | fix DNS/firewall; use `acme_ca` staging while testing to avoid rate limits |
 | Registration returns 402 or 428 | a captcha or push challenge is required | send the captcha token `noop.noop.registration.noop` |
+| Desktop: **New group** turns the window blank; log says `Failed to parse global.groupsv2.maxGroupSize as an integer` | `remoteConfig.globalConfig` in `staging.yml` lacks the group size limits | set `groupsv2.maxGroupSize` and `groupsv2.groupSizeHardLimit` (without `global.`: the server adds that prefix), restart `chat`, reload the client |
+| Desktop: group creation says "This group couldn't be created"; `PUT /v2/groups 404` in its log | no groups (storage) service is deployed | expected; see section 5c |
 | An attachment spins forever; the client log shows a POST to `gcs.disabled.swarm.invalid` | the account got a CDN2 form: the `cdn3` experiment is missing from `s3://swarm-config/dynamic-config.yaml` | `docker compose up minio-bootstrap` (re-uploads `minio/dynamic-config.yaml`); the server re-reads it within 30 s |
 | `tus` answers 401 to every upload | `SWARM_TUS_TOKEN_SECRET` in `tus.env` is not `tus.userAuthenticationTokenSharedSecret` | fix `tus.env`, `docker compose up -d --no-deps tus` |
 | `tus` is unhealthy, `/healthz` says `S3 HEAD answered 403` | its MinIO user or policy is missing | `docker compose up minio-bootstrap`, then wait a minute (it re-probes) |
