@@ -7,6 +7,7 @@
 #   Redis clusters cache/rate/...    redis:7.4-alpine, one single-node cluster per role (redis/single-node-cluster.sh)
 #   Redis          pubsub            redis (standalone)
 #   S3             CDN + paged PQ    minio
+#   CDN3 uploads   attachments       ./tus (TUS 1.0.0 into the MinIO CDN bucket)
 #   Registration   SMS verification  ./registration-stub (fixed code, staging only)
 #   TLS            public edge       caddy (profile: edge)
 #
@@ -37,6 +38,7 @@ volumes:
   fdb-etc:
   dynamodb-data:
   minio-data:
+  tus-data:
   caddy-data:
   caddy-config:
   redis-cache-data:
@@ -262,6 +264,11 @@ services:
       SWARM_CDN_SECRET_KEY: ${SWARM_CDN_SECRET_KEY:?set SWARM_CDN_SECRET_KEY in .env}
       SWARM_AWS_ACCESS_KEY_ID: ${SWARM_AWS_ACCESS_KEY_ID:?set SWARM_AWS_ACCESS_KEY_ID in .env}
       SWARM_AWS_SECRET_ACCESS_KEY: ${SWARM_AWS_SECRET_ACCESS_KEY:?set SWARM_AWS_SECRET_ACCESS_KEY in .env}
+    # The CDN3 upload service's MinIO user (SWARM_TUS_S3_*), written by tus/make-tus-env.sh.
+    # Optional so that a host without it still bootstraps; the script then warns and skips it.
+    env_file:
+      - path: tus.env
+        required: false
     volumes:
       - ./minio/bootstrap-buckets.sh:/bootstrap-buckets.sh:ro
       - ./minio/dynamic-config.yaml:/in/dynamic-config.yaml:ro
@@ -269,6 +276,44 @@ services:
     entrypoint: ["/bin/sh", "/bootstrap-buckets.sh"]
     networks:
       - swarm
+
+  # ---------------------------------------------------------------- CDN3 attachment uploads
+  # TUS 1.0.0 (creation-with-upload, HEAD, PATCH) for message attachments. Caddy sends
+  # https://cdn.<domain>/upload/attachments here; the service checks the chat server's upload
+  # token on every request and writes finished uploads into the CDN bucket as attachments/<key>.
+  # Reads go from Caddy straight to MinIO. Contract and runbook: docs/STAGING.md, section 8a.
+  tus:
+    <<: *restart
+    build:
+      context: ./tus
+    image: swarm-messenger/tus:staging
+    hostname: tus
+    depends_on:
+      minio-bootstrap:
+        condition: service_completed_successfully
+    # SWARM_TUS_TOKEN_SECRET and the service's own MinIO key. Not .env: the chat container reads
+    # all of .env, and its environment should not change for this.
+    env_file:
+      - path: tus.env
+        required: false
+    environment:
+      TUS_PUBLIC_UPLOAD_URI: https://${SWARM_CDN_DOMAIN:-cdn.chat.swarm.green}/upload
+      TUS_S3_ENDPOINT: http://minio:9000
+      TUS_S3_BUCKET: ${SWARM_CDN_BUCKET:-swarm-cdn}
+      TUS_S3_REGION: ${SWARM_AWS_REGION:-us-east-1}
+      # attachments.maxAttachmentUploadSizeInBytes in staging.yml
+      TUS_MAX_UPLOAD_BYTES: "104857600"
+    volumes:
+      - tus-data:/data
+    networks:
+      - swarm
+    healthcheck:
+      # 200 once the service's MinIO key can read under attachments/ (probed every minute).
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:1080/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
 
   # ---------------------------------------------------------------- registration stub
   # Issues and accepts one fixed verification code. Refuses to start unless

@@ -82,6 +82,55 @@ else
   echo "[minio-bootstrap] WARNING: SWARM_AWS_ACCESS_KEY_ID not set; the chat server will get 403s" >&2
 fi
 
+# Reads from the CDN are anonymous, as on Signal's own CDNs: an object name is 120 or more random
+# bits and every object is end-to-end-encrypted ciphertext. Anonymous access is s3:GetObject on
+# exactly the two prefixes clients read, attachments/ (CDN3 uploads) and profiles/ (avatars):
+# no listing, nothing else. Caddy publishes only GET/HEAD on those two paths.
+# See docs/STAGING.md, section 8a.
+cat > /tmp/swarm-cdn-anonymous.json <<'JSON'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {"AWS": ["*"]},
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::swarm-cdn/attachments/*", "arn:aws:s3:::swarm-cdn/profiles/*"]
+    }
+  ]
+}
+JSON
+mc anonymous set-json /tmp/swarm-cdn-anonymous.json local/swarm-cdn
+echo "[minio-bootstrap] anonymous GetObject on swarm-cdn/attachments/* and swarm-cdn/profiles/*"
+
+# The CDN3 upload service (tus/) writes finished attachments with its own key, which may put and
+# get objects under attachments/ and nothing else. Its credentials come from tus.env.
+if [ -n "${SWARM_TUS_S3_ACCESS_KEY:-}" ] && [ -n "${SWARM_TUS_S3_SECRET_KEY:-}" ]; then
+  if mc admin user info local "${SWARM_TUS_S3_ACCESS_KEY}" >/dev/null 2>&1; then
+    echo "[minio-bootstrap] = user ${SWARM_TUS_S3_ACCESS_KEY} (exists)"
+  else
+    mc admin user add local "${SWARM_TUS_S3_ACCESS_KEY}" "${SWARM_TUS_S3_SECRET_KEY}" >/dev/null
+    echo "[minio-bootstrap] + user ${SWARM_TUS_S3_ACCESS_KEY}"
+  fi
+  cat > /tmp/swarm-tus-policy.json <<'JSON'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": ["arn:aws:s3:::swarm-cdn/attachments/*"]
+    }
+  ]
+}
+JSON
+  mc admin policy create local swarm-tus-attachments /tmp/swarm-tus-policy.json >/dev/null 2>&1 || true
+  mc admin policy attach local swarm-tus-attachments --user "${SWARM_TUS_S3_ACCESS_KEY}" >/dev/null 2>&1 || true
+  echo "[minio-bootstrap] policy swarm-tus-attachments -> ${SWARM_TUS_S3_ACCESS_KEY}"
+else
+  echo "[minio-bootstrap] WARNING: SWARM_TUS_S3_* not set (tus/make-tus-env.sh); attachment uploads will fail" >&2
+fi
+
 # The two polled objects. Always re-uploaded, so editing minio/dynamic-config.yaml and
 # re-running this service is how staging's dynamic configuration is changed.
 echo "[minio-bootstrap] uploading dynamic-config.yaml"

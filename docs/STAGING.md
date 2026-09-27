@@ -65,6 +65,7 @@ Internal to the Docker network `swarm-staging` (10.77.0.0/24), never published:
 | `10.77.0.21-24:6379` | the four Redis clusters (cache, push scheduler, rate limiters, message cache) |
 | `10.77.0.25:6379` | the standalone Redis for `pubsub` |
 | `minio:9000`, `minio:9001` | MinIO S3 API and console |
+| `tus:1080` | the CDN3 (TUS) upload service for attachments. Caddy publishes only `/upload/attachments` on it (section 8a) |
 | `registration-stub:8443` | the fixed-code registration stub, gRPC over TLS with a private CA |
 
 The Redis clusters have static IPs on purpose: a Redis cluster advertises the address it
@@ -90,7 +91,7 @@ Four names, all `A` (and `AAAA` if the host has IPv6) to the staging host:
 | Name | Answered by | Status |
 |---|---|---|
 | `chat.swarm.green` | Caddy → chat:8080 | **required.** The API and the websocket. This is the only endpoint clients talk to |
-| `cdn.chat.swarm.green` | Caddy → MinIO, read-only | **required for attachments.** GET/HEAD only; uploads go through the chat server's signed-URL flow |
+| `cdn.chat.swarm.green` | Caddy → MinIO and the `tus` service | **required for attachments and avatars.** Anonymous GET/HEAD of `attachments/*` and `profiles/*`, TUS uploads under `/upload/attachments` (token from the chat server), avatar POST forms (signed by the chat server). Nothing else; see section 8a |
 | `reg.chat.swarm.green` | Caddy, returns 404 | **reserved, deliberately not proxied.** The registration stub accepts one fixed code for every phone number; publishing it would let anyone register any number. The name exists so a misconfigured client fails loudly instead of silently reaching something else |
 | `sfu.chat.swarm.green` | nothing yet | **reserved.** Named in the TURN configuration because `CloudflareTurnConfiguration.urls` is `@NotEmpty` and cannot be left empty. No SFU or TURN server is deployed, so calling does not work |
 
@@ -162,8 +163,9 @@ cd deploy/staging
 # 2. Stage exactly what the chat image needs (one jar, one libfdb_c.so) into build/.
 ./prepare-image.sh
 
-# 3. Generate this deployment's secrets, internal CA, .env and staging-secrets.yml.
-#    Uses the server's own certificate command and zkparams/SwarmZkParams.java, i.e. libsignal.
+# 3. Generate this deployment's secrets, internal CA, .env, staging-secrets.yml and tus.env
+#    (the attachment upload service's credentials, section 8a). Uses the server's own
+#    certificate command and zkparams/SwarmZkParams.java, i.e. libsignal.
 ./generate-secrets.sh
 
 # 4. One value the script cannot know.
@@ -398,7 +400,9 @@ foundationdb            (healthy: fdbcli reports "The database is available")
 dynamodb                (healthy: answers HTTP)
   └─ dynamodb-bootstrap (creates 34 tables + TTLs, then exits 0)
 minio                   (healthy: mc ready)
-  └─ minio-bootstrap    (3 buckets, scoped CDN key, uploads the 2 polled objects, exits 0)
+  └─ minio-bootstrap    (3 buckets, scoped CDN key, the tus key, anonymous reads of
+       │                 attachments/ and profiles/, uploads the 2 polled objects, exits 0)
+       └─ tus           (healthy: its MinIO key can read under attachments/)
 redis-cache, redis-pushscheduler, redis-ratelimiters, redis-messages
                         (healthy: cluster_state:ok)
 redis-pubsub            (healthy: PONG)
@@ -458,6 +462,9 @@ docker compose exec redis-pubsub redis-cli ping
 # MinIO
 docker compose exec minio mc ready local
 
+# the CDN3 upload service ("ok", or why its MinIO key does not work)
+docker compose exec tus node -e "fetch('http://127.0.0.1:1080/healthz').then(async r => console.log(r.status, await r.text()))"
+
 # the registration stub
 docker compose exec registration-stub python /app/healthcheck.py && echo STUB-OK
 
@@ -515,7 +522,7 @@ demonstrably boots a server with them (`./mvnw integration-test -Ptest-server`).
 | **APNs** | `disabled` team/key id and a freshly generated throwaway EC key | iOS devices do not wake on new messages |
 | **FCM** | a service-account JSON that points at nothing | Android devices do not wake on new messages |
 | **Push in general** | consequence of the two above | **Desktop is unaffected**: it holds a websocket open and receives messages in real time. This is why desktop is phase 1 |
-| **GCP attachments (CDN0/CDN2)** | `gcs.disabled.swarm.invalid`, throwaway RSA signing key | The CDN0/CDN2 upload-form endpoints return unusable URLs. Attachments go through the `cdn` block (MinIO) instead |
+| **GCP attachments (CDN2)** | `gcs.disabled.swarm.invalid`, throwaway RSA signing key | A CDN2 form would point at a name that does not resolve, so none is handed out: the dynamic-configuration experiment `cdn3` gives every account CDN3 (TUS) forms, served by the `tus` service. Avatars use CDN0, the `cdn` block (MinIO). Section 8a |
 | **Cloudflare TURN / calling** | `urls` names `sfu.chat.swarm.green`, which has no server; API endpoint is `turn.disabled.swarm.invalid` | Voice and video calling does not work. `urls` and `urlsWithIps` are `@NotEmpty` upstream, so they could not simply be emptied |
 | **MobileCoin payments** | `paymentCurrencies: [MOB]` kept only because it is `@NotEmpty`; conversion API keys are `unset` | Upstream's payment feature is dead. Irrelevant: the SWARM wallet is on-device and does not use it |
 | **Spam filtering, registration fraud checks, captcha** | the private `spam-filter` submodule is not part of this fork | Upstream's no-op implementations apply. **Captcha accepts the token `noop.noop.registration.noop`** — that is what makes manual registration possible, and it is also why this stack must never be exposed as a real service |
@@ -697,14 +704,53 @@ POST-policy write needs a policy signed with the CDN key.
 
 ### The upload service: `deploy/staging/tus/`
 
-Node 22, standard library only (`server.mjs`), about the size of the registration stub. It
-stages the bytes of an upload in the volume `tus-data` and, when the last byte arrives, writes the
+Node 22, standard library only: one file, `server.mjs`, with its tests in `tus/test/`
+(`node --test deploy/staging/tus/test/server.test.mjs`). It stages the bytes of an upload in the volume `tus-data` and, when the last byte arrives, writes the
 object to MinIO with one SigV4 `PutObject`, using its **own** MinIO user, which may only put and
 get objects under `swarm-cdn/attachments/`. Its credentials live in `deploy/staging/tus.env`
 (mode 600, git-ignored), written once by `tus/make-tus-env.sh`: its copy of
 `tus.userAuthenticationTokenSharedSecret` (it must stay equal to the one in
 `staging-secrets.yml`) and its MinIO key. A separate file, so the chat container's environment
 does not change.
+
+### Runbook
+
+First deployment on a host that already runs the stack, from `deploy/staging` in a checkout of
+this revision:
+
+```sh
+./tus/make-tus-env.sh                 # once: writes tus.env (mode 600), prints no secret
+docker compose build tus
+docker compose up minio-bootstrap     # the tus MinIO user, the anonymous read policy, and the
+                                      # re-upload of minio/dynamic-config.yaml (cdn3 on)
+docker compose up -d --no-deps tus    # healthy within ~20 s: docker compose ps tus
+docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+No chat restart: `staging.yml` does not change, and the server re-reads the dynamic configuration
+every 30 s (`dynamicConfig.refreshInterval`). `--no-deps` keeps compose from touching anything the
+service depends on.
+
+Checks from anywhere:
+
+```sh
+curl -si -X OPTIONS https://cdn.chat.swarm.green/upload/attachments | grep -i '^tus-'  # Tus-Version: 1.0.0
+curl -so /dev/null -w '%{http_code}\n' -X POST https://cdn.chat.swarm.green/upload/attachments  # 412, not 405
+curl -sI https://cdn.chat.swarm.green/attachments/<key>   # 200 with Content-Length for an uploaded key
+curl -so /dev/null -w '%{http_code}\n' https://cdn.chat.swarm.green/                 # 404: no listing
+```
+
+On the host: `docker compose logs --tail 50 tus` prints one line per request (method, the first
+four characters of the key, status, bytes, time), never a header.
+
+- **CDN3 off again** (every form back to CDN2, which does not work here): set
+  `enrollmentPercentage: 0` in `minio/dynamic-config.yaml` and `docker compose up minio-bootstrap`.
+- **Rotating the token secret**: it lives in two places, `tus.userAuthenticationTokenSharedSecret`
+  in `staging-secrets.yml` and `SWARM_TUS_TOKEN_SECRET` in `tus.env`. Change both, then
+  `docker compose up -d chat` and `docker compose up -d --no-deps tus`. Uploads in flight fail;
+  clients retry with new forms.
+- **Unfinished uploads** live in the volume `tus-data` and are deleted 7 days after they started.
+  Losing the volume loses only unfinished uploads.
 
 ---
 
@@ -715,10 +761,12 @@ does not change.
 | **`deploy/staging/staging-secrets.yml`** | host filesystem, mode 600 | **Back this up off the host.** The four zk secrets and the sealed-sender trust root are baked into credentials clients already hold; rotating them means updating every client |
 | **`deploy/staging/certs/`** | host filesystem | back up. Regenerating means editing `SWARM_REGISTRATION_CA_PEM` in `.env` and restarting `chat` |
 | **`deploy/staging/.env`** | host filesystem, mode 600 | back up. Contains the public zk half and the sealed-sender certificate, which must stay paired with the secrets |
+| `deploy/staging/tus.env` | host filesystem, mode 600 | back up, or recreate: `tus/make-tus-env.sh` copies the token secret from `staging-secrets.yml` again and makes a new MinIO key (then re-run `minio-bootstrap`) |
 | `deploy/staging/shared/staging-public-params.json` | host filesystem | public, but regenerate-or-back-up: it is the record of what the clients were built against |
 | Accounts, keys, profiles, sessions | Docker volume `dynamodb-data` | `docker compose stop chat dynamodb && tar` the volume. DynamoDB Local is a single SQLite-ish file per table set |
 | Undelivered and stored messages | Docker volume `fdb-data` + `redis-messages-data` | `fdbbackup` for a consistent copy. For staging, stopping `chat` and tarring the volume is acceptable |
-| Attachments | Docker volume `minio-data` | `mc mirror` to another location |
+| Attachments and avatars | Docker volume `minio-data` | `mc mirror` to another location |
+| Unfinished attachment uploads | Docker volume `tus-data` | not worth backing up: clients retry a failed send with a new upload form |
 
 Nothing here is a supported disaster-recovery story. It is a staging stack: assume you can
 lose it and re-register the test accounts.
@@ -739,6 +787,10 @@ lose it and re-register the test accounts.
 | DynamoDB `ResourceNotFoundException` naming a `swarm_*` table | the bootstrap one-shot did not finish | `docker compose up dynamodb-bootstrap` and read its output |
 | Caddy cannot get a certificate | DNS does not point here yet, or 80/443 are blocked | fix DNS/firewall; use `acme_ca` staging while testing to avoid rate limits |
 | Registration returns 402 or 428 | a captcha or push challenge is required | send the captcha token `noop.noop.registration.noop` |
+| An attachment spins forever; the client log shows a POST to `gcs.disabled.swarm.invalid` | the account got a CDN2 form: the `cdn3` experiment is missing from `s3://swarm-config/dynamic-config.yaml` | `docker compose up minio-bootstrap` (re-uploads `minio/dynamic-config.yaml`); the server re-reads it within 30 s |
+| `tus` answers 401 to every upload | `SWARM_TUS_TOKEN_SECRET` in `tus.env` is not `tus.userAuthenticationTokenSharedSecret` | fix `tus.env`, `docker compose up -d --no-deps tus` |
+| `tus` is unhealthy, `/healthz` says `S3 HEAD answered 403` | its MinIO user or policy is missing | `docker compose up minio-bootstrap`, then wait a minute (it re-probes) |
+| Downloads from `cdn.` answer 403 with `Server: MinIO` | the bucket's anonymous read policy is missing | `docker compose up minio-bootstrap`; check with `mc anonymous get-json local/swarm-cdn` |
 
 Logs:
 

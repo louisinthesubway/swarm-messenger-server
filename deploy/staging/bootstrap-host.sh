@@ -294,6 +294,9 @@ done
 printf 'redis-pubsub:           '
 docker compose exec -T redis-pubsub redis-cli ping 2>/dev/null || echo "FAILED"
 
+printf 'attachment uploads:     '
+docker compose exec -T tus node -e "fetch('http://127.0.0.1:1080/healthz').then(r => process.exit(r.ok ? 0 : 1))" >/dev/null 2>&1 && echo "ok" || echo "FAILED (docker compose logs tus)"
+
 cat <<EOF
 
 $(printf '\033[1m==> the staging server is up\033[0m')
@@ -310,6 +313,7 @@ $(printf '\033[1m==> the staging server is up\033[0m')
   PRIVATE, back these up off this host:
       ${STAGING}/staging-secrets.yml
       ${STAGING}/.env
+      ${STAGING}/tus.env
       ${STAGING}/certs/
 
   The fixed verification code every phone number accepts:

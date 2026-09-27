@@ -283,12 +283,17 @@ PY
 chmod 600 staging-secrets.yml .env
 chmod 644 shared/staging-public-params.json
 
+# The CDN3 upload service's own file: its copy of tus.userAuthenticationTokenSharedSecret and its
+# MinIO key (docs/STAGING.md, section 8a). Separate from .env on purpose.
+./tus/make-tus-env.sh >/dev/null
+
 cat <<EOF
 
 ==> done
 
   staging-secrets.yml                $(wc -l < staging-secrets.yml) lines, mode 600   PRIVATE, back it up
   .env                               $(wc -l < .env) lines, mode 600   PRIVATE
+  tus.env                            the CDN3 upload service's credentials, mode 600   PRIVATE
   certs/                             internal CA + registration-stub certificate
   shared/staging-public-params.json  PUBLIC — give this to whoever builds the clients
 

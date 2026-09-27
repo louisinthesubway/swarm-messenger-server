@@ -24,3 +24,11 @@ captcha:
 # Allow every client to use the gRPC surface. Staging has no staged rollout.
 grpcAllowList:
   enableAll: true
+
+# Attachments: every account gets a CDN3 (TUS) upload form. AttachmentControllerV4 and the gRPC
+# AttachmentsGrpcService hand CDN3 to accounts enrolled in the experiment named "cdn3" and CDN2
+# (Google Cloud Storage) to everyone else, and CDN2 cannot work on this stack. CDN3 uploads go to
+# the tus service behind the CDN name. See docs/STAGING.md, section 8a.
+experiments:
+  cdn3:
+    enrollmentPercentage: 100

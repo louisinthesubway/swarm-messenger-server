@@ -3,6 +3,7 @@
 # least helpful error messages there is. Force LF no matter what the checkout platform does.
 *.sh            text eol=lf
 *.py            text eol=lf
+*.mjs           text eol=lf
 *.yml           text eol=lf
 *.yaml          text eol=lf
 *.tsv           text eol=lf

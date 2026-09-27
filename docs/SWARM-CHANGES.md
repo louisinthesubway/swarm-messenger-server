@@ -131,10 +131,11 @@ New directory. Nothing outside it is affected and the upstream build ignores it.
 | `Dockerfile`, `prepare-image.sh`, `.dockerignore` | the chat server image: `eclipse-temurin:26-jre-resolute` + the shaded jar + `libfdb_c.so`, mirroring upstream's jib configuration. `prepare-image.sh` stages exactly those two files so the `COPY` is unambiguous and the build context is two files rather than the whole repository |
 | `dynamodb/bootstrap-tables.sh` | creates all 34 tables and their TTLs. Every key schema cites the Java class and constant it came from |
 | `foundationdb/init-foundationdb.sh` | `configure new single ssd` on first start; idempotent |
-| `minio/bootstrap-buckets.sh`, `minio/dynamic-config.yaml`, `minio/asn.tsv` | the three buckets, a scoped CDN credential, and the two objects the server polls |
+| `minio/bootstrap-buckets.sh`, `minio/dynamic-config.yaml`, `minio/asn.tsv` | the three buckets, a scoped CDN credential, the upload service's credential, anonymous reads of `attachments/` and `profiles/` only, and the two objects the server polls (the dynamic configuration turns on CDN3 for every account) |
+| `tus/` | the CDN3 (TUS 1.0.0) upload service for message attachments: `server.mjs` (Node standard library only), its tests, `Dockerfile`, and `make-tus-env.sh` for its credentials. It stands in for Signal's Cloudflare tus-server with the same paths, token and status codes; see `docs/STAGING.md`, section 8a |
 | `registration-stub/` | the fixed-verification-code gRPC service (Python, ~200 lines) and its `RegistrationService.proto` copy |
 | `certs/make-certs.sh` | the internal CA and the stub's server certificate |
-| `caddy/Caddyfile` | TLS edge for `chat.swarm.green` and `cdn.chat.swarm.green` |
+| `caddy/Caddyfile` | TLS edge for `chat.swarm.green` and `cdn.chat.swarm.green` (anonymous reads, TUS uploads to `tus`, avatar POST forms to MinIO; nothing else) |
 
 `registration-stub/RegistrationService.proto` is a verbatim copy of
 `service/src/main/proto/RegistrationService.proto`. Keep the copy in sync when rebasing; the

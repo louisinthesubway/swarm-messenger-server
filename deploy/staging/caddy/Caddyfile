@@ -89,20 +89,61 @@
 }
 
 # ------------------------------------------------------------------ attachments / CDN
-# Objects live in MinIO. Requests are rewritten to the bucket so clients never see the
-# bucket name, and only reads are allowed through the edge: uploads go through the chat
-# server's signed-URL flow.
+# Objects live in the MinIO bucket swarm-cdn; clients never see the bucket name. Contract and
+# runbook: docs/STAGING.md, section 8a.
+#
+#   POST PATCH HEAD OPTIONS  /upload/attachments[/<key>]   CDN3 (TUS) attachment uploads -> tus,
+#                                                          which checks the chat server's upload
+#                                                          token on every request
+#   POST multipart/form-data /                             CDN0 avatar uploads (an S3 POST
+#                                                          policy) -> MinIO, which checks the
+#                                                          policy's signature
+#   GET HEAD                 /attachments/*, /profiles/*   anonymous reads -> MinIO; the bucket
+#                                                          policy allows GetObject on exactly
+#                                                          these two prefixes
+#
+# Nothing else gets through. No `encode`: every object is ciphertext, which does not compress, and
+# the desktop refuses an attachment download without Content-Length, which the encoder drops.
 {$SWARM_CDN_DOMAIN} {
-	encode zstd gzip
+	@tus {
+		path /upload/attachments /upload/attachments/*
+		method POST PATCH HEAD OPTIONS
+	}
+	handle @tus {
+		request_body {
+			# attachments.maxAttachmentUploadSizeInBytes is 100 MiB; the service enforces the
+			# exact limit from the token.
+			max_size 105MB
+		}
+		reverse_proxy tus:1080
+	}
 
-	@readonly method GET HEAD
-	handle @readonly {
-		rewrite * /swarm-cdn{uri}
+	@avatarUpload {
+		method POST
+		path /
+		header Content-Type multipart/form-data*
+	}
+	handle @avatarUpload {
+		request_body {
+			# ProfileHelper.MAX_PROFILE_AVATAR_SIZE_BYTES is 10 MiB, plus the form fields.
+			max_size 11MB
+		}
+		rewrite * /swarm-cdn
+		reverse_proxy minio:9000
+	}
+
+	@read {
+		method GET HEAD
+		path /attachments/* /profiles/*
+	}
+	handle @read {
+		# {path}, not {uri}: no query string reaches MinIO, so no S3 sub-resources either.
+		rewrite * /swarm-cdn{path}
 		reverse_proxy minio:9000
 	}
 
 	handle {
-		respond "method not allowed" 405
+		respond "not found" 404
 	}
 
 	log {

@@ -5,6 +5,9 @@
 
 .env
 staging-secrets.yml
+# The CDN3 upload service's credentials (tus/make-tus-env.sh).
+tus.env
+tus.env.tmp
 
 # Public, but deployment-specific: regenerated on every host, handed to the client builds by
 # hand rather than committed. See docs/STAGING.md ("Public parameters for the clients").
