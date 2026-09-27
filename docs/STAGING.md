@@ -410,6 +410,86 @@ vault ("Opus M-H discovery") has the details.
 
 ---
 
+## 5c. Groups and settings sync need `signalapp/storage-service` (PROPOSED, not deployed)
+
+**Status: PROPOSED** (2026-09-27, Opus M-H, from reading the desktop and the upstream repository).
+Nothing in this section is deployed or tested on the staging host.
+
+### What fails today
+
+The desktop's `storageUrl` is `https://chat.swarm.green`, and the chat server (Signal-Server) does
+not serve Signal's storage API. Every storage call answers `404`:
+
+* **Groups.** `PUT /v2/groups` (create): after the group credentials verify, the desktop shows
+  "This group couldn't be created. Check your connection and try again." (seen 2026-09-27
+  22:16 UTC). Receiving, joining and changing groups use the same service.
+* **Settings and contacts sync.** `PUT /v1/storage/` and friends are logged as `404` on every
+  change; the app keeps working without them.
+
+### What the desktop calls on `storageUrl`
+
+From `STORAGE_CALLS` in `ts/textsecure/WebAPI.preload.ts`:
+
+| Path | Method | What for | Authentication |
+|---|---|---|---|
+| `v2/groups` | `PUT` / `GET` / `PATCH` | create / fetch / change a group | group auth: `Basic` with the group public params and a zkgroup auth-credential presentation, verified with the groups `ServerSecretParams` |
+| `v2/groups/logs/<from-version>` | `GET` | group change history | group auth |
+| `v2/groups/joined_at_version` | `GET` | where this member's history starts | group auth |
+| `v2/groups/join/<link-password>` | `GET` | preview before joining by link | group auth |
+| `v2/groups/token` | `GET` | external credential for group calls | group auth |
+| `v2/groups/avatar/form` | `GET` | an S3 POST policy for a group avatar upload | group auth |
+| `v1/storage/manifest` (and `/version/<v>`) | `GET` | settings/contacts manifest | `Basic` user/password the chat server issues on `GET /v1/storage/auth` (HMAC with `storageService.userAuthenticationTokenSharedSecret`) |
+| `v1/storage/read` | `PUT` | read records | same |
+| `v1/storage/` | `PUT` | write manifest + records | same |
+
+### What `signalapp/storage-service` is
+
+Upstream, AGPL-3.0, a Dropwizard service (`GroupsController`, `GroupsV1Controller`,
+`StorageController`). Its configuration (`StorageServiceConfiguration`):
+
+* `bigtable`: `projectId`, `instanceId`, and four tables - `contactManifestsTableId`,
+  `contactsTableId`, `groupsTableId`, `groupLogsTableId`.
+* `authentication.key` (hex): the **same** secret as this server's
+  `storageService.userAuthenticationTokenSharedSecret`, or the `/v1/storage/auth` credentials do
+  not verify.
+* `zkConfig.serverSecret`: the **same** `ServerSecretParams` as this server's
+  `groupsZkConfig.serverSecret`, or no group credential verifies.
+* `cdn`: `accessKey`, `accessSecret`, `bucket`, `region` - S3 POST policies for group avatars.
+  MinIO can check those the way it already checks profile avatars (section 8a).
+* `group`: `maxGroupSize`, title/description byte limits, a 32-byte `externalServiceSecret` for
+  the group-call token, send-endorsement lifetimes.
+
+**Its only storage backend is Google Cloud Bigtable** (`BigtableDataClient` from
+`BigtableDataSettings.newBuilder()` with the project and instance above). Upstream's tests run
+against the in-memory Bigtable emulator (`BigtableEmulatorExtension`).
+
+### What a self-hosted SWARM deployment would need
+
+Three options, in order of effort:
+
+1. **Bigtable emulator (staging only).** Run the emulator in a container, create the four tables
+   and their column families at start, and point the service at it
+   (`BIGTABLE_EMULATOR_HOST`; check that the pinned client library honours it, or build the
+   settings with `newBuilderForEmulator`). **The emulator keeps everything in memory: every group
+   and every synced setting is lost when it restarts.** Good enough to prove groups end to end.
+2. **Cloud Bigtable.** Durable, but a Google Cloud account and a runtime dependency on a third
+   party, which this stack avoids everywhere else (section 1: "the stack contacts no third party at
+   runtime").
+3. **A SWARM fork of `storage-service` with its own table backend** - FoundationDB (already in the
+   stack) or a SQL store - implementing the four tables with the same conditional writes (manifest
+   version compare-and-set, group version checks, group-log range reads). The only durable,
+   self-hosted option, and the most work.
+
+In every option: route `/v1/storage/*` and `/v2/groups*` on `chat.swarm.green` to the service in
+the Caddyfile (or give it its own host name and change the clients' `storageUrl`), set this
+server's `storageService.uri`, wire the two shared secrets from `staging-secrets.yml`, and allow
+the group-avatar prefix in the CDN bucket policy.
+
+Recommendation: a separate milestone; option 1 to prove groups on staging, option 3 before anything
+real depends on groups.
+
+---
+
 ## 6. Start order
 
 Compose enforces this with `depends_on` conditions, but know it for debugging:
