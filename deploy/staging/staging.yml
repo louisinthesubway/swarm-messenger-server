@@ -365,8 +365,18 @@ svrb:
   svrCaCertificates:
     - "${SWARM_REGISTRATION_CA_PEM}"
 
+# ---------------------------------------------------------------------------- storage service
+# Groups and settings sync are served by a separate application, the storage service (`storage`
+# in docker-compose.yml, configured by storage.yml). Clients reach it through Caddy on the chat
+# name (/v1/storage*, /v2/groups*); this server calls it only for DELETE /v1/storage when an
+# account is deleted, over plain HTTP on the compose network (Java's HTTP client does not use
+# the TLS settings for an http:// URI; storageCaCertificates stays because it must not be empty).
+# The storage service verifies what this server issues with the SAME two secrets:
+# storageService.userAuthenticationTokenSharedSecret (the /v1/storage/auth credentials) and
+# groupsZkConfig.serverSecret (group and profile key credentials); storage/make-storage-env.sh
+# copies them. See docs/STAGING.md, section 5c.
 storageService:
-  uri: storage.disabled.swarm.invalid
+  uri: http://storage:8080
   userAuthenticationTokenSharedSecret: secret://storageService.userAuthenticationTokenSharedSecret
   storageCaCertificates:
     - "${SWARM_REGISTRATION_CA_PEM}"

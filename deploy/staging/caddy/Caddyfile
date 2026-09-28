@@ -66,6 +66,25 @@
 		}
 	}
 
+	# SWARM (2026-09-28): groups and settings/contacts sync. These two API families belong to
+	# Signal's storage service, not to the chat server (which answered 404 for them). The
+	# storage service (`storage`, swarm-storage-service) checks group credentials against the
+	# same zkgroup secret the chat server issues them with, and the /v1/storage Basic
+	# credentials against the chat server's storageService shared secret. GET /v1/storage/auth,
+	# which HANDS OUT those credentials, is the chat server's own (SecureStorageController) and
+	# stays with it. Plain HTTP/1.1 on the compose network. docs/STAGING.md, section 5c.
+	@storage {
+		path /v1/storage /v1/storage/* /v2/groups /v2/groups/*
+		not path /v1/storage/auth
+	}
+	handle @storage {
+		reverse_proxy storage:8080 {
+			transport http {
+				versions 1.1
+			}
+		}
+	}
+
 	handle {
 		reverse_proxy chat:8080 {
 			transport http {
