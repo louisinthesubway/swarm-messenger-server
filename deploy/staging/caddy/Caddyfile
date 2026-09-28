@@ -165,3 +165,75 @@
 		format console
 	}
 }
+
+# ------------------------------------------------------------------ swarm-pay (testnet staging)
+# SWARM Market's escrow service, called by the web app on Vercel. Source of this
+# block: market/deploy/swarm-pay-host/caddy-site.snippet in the SWARM Market
+# repository; the runbook is README.md next to it ("Variant A").
+#
+# For the Messenger session — this whole file is safe to paste, comments included:
+#   1. Before: DNS A pay-staging.swarm.green -> 64.95.11.180, and the container
+#      swarm-pay-staging running on the network swarm-staging:
+#        docker network inspect swarm-staging --format '{{range .Containers}}{{.Name}} {{end}}'
+#   2. Append this file to deploy/staging/caddy/Caddyfile, commit it in
+#      swarm-messenger-server so a redeploy keeps it, and bring the host copy
+#      (/opt/swarm/swarm-messenger-server/deploy/staging/caddy/Caddyfile) to the
+#      same content.
+#   3. In /opt/swarm/swarm-messenger-server/deploy/staging, validate the new file
+#      in a one-off container (it sees the file on disk):
+#        docker compose --profile edge run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+#   4. Apply. If the running container already sees the new block —
+#        docker compose --profile edge exec caddy grep -c 'pay-staging.swarm.green {' /etc/caddy/Caddyfile   # 1
+#      — reload without dropping connections:
+#        docker compose --profile edge exec caddy caddy reload --config /etc/caddy/Caddyfile
+#      If it prints 0, the file was replaced on disk (a new inode, e.g. by git or
+#      an editor) and the single-file bind mount still shows the old one; then
+#      `docker compose --profile edge up -d --force-recreate caddy` (chat and cdn
+#      lose TLS for a few seconds).
+#   5. Verify: `docker compose --profile edge logs --since 10m caddy` shows a
+#      certificate obtained for pay-staging.swarm.green; from outside,
+#      https://pay-staging.swarm.green/healthz answers 200 with {"ok":…},
+#      /metrics and / answer 404, and chat.swarm.green answers as before.
+#
+# The @marketplace line is copied verbatim from market/services/swarm-pay/Caddyfile,
+# the one route allowlist for every swarm-pay edge: change it there first. Every
+# other path — the remaining /v1/admin routes, /metrics, / — answers 404; the
+# operator uses them on the swarm-pay host through `docker compose exec`, so the
+# admin token never leaves it. No Referrer-Policy here, and never `no-referrer`
+# at an edge: browsers then send `Origin: null` on same-origin form POSTs, which
+# the web app's CSRF check refuses (hotfix 19680f7). This site is an API only.
+pay-staging.swarm.green {
+	@marketplace path /healthz /v1/invoices /v1/invoices/* /v1/escrows/* /v1/payouts/* /v1/wallet/summary /v1/admin/validate-address
+
+	handle @marketplace {
+		reverse_proxy swarm-pay-staging:8790 {
+			# swarm-pay stores no client address; do not hand it one.
+			header_up -X-Forwarded-For
+			header_up -X-Real-IP
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+
+	# Minimal access log: no client IP, no headers (the Authorization header
+	# included).
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>remote_ip delete
+				request>client_ip delete
+				request>headers delete
+			}
+		}
+	}
+}
