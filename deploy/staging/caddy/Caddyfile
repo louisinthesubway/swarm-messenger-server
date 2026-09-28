@@ -82,6 +82,18 @@
 		respond "not found" 404
 	}
 
+	# SWARM (2026-09-28, first public desktop release): accounts are created with
+	# the wallet sign-in (/v1/swarm/registration/* then Signal's own /v1/registration
+	# with a registration password), never with a phone number. The phone
+	# verification API would otherwise still be reachable and, in this stack, is
+	# served by the staging channel with a fixed code (the chat server refuses to
+	# start without it - SWARM_STAGING_FIXED_CODE), so the edge answers 404 for it.
+	# No SWARM client calls these paths.
+	@phoneVerification path /v1/verification /v1/verification/*
+	handle @phoneVerification {
+		respond "not found" 404
+	}
+
 	log {
 		output stdout
 		format console
