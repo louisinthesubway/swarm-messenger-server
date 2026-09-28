@@ -5,9 +5,11 @@
 # Data at stake, all small today: DynamoDB Local (accounts, keys, profiles,
 # usernames), FoundationDB (messages and the rest of the chat state), MinIO
 # (encrypted attachments and profile photos), redis-messages (the message
-# cache). It is a LOCAL snapshot on the same disk: it protects against an
-# operator mistake or a bad deploy, not against losing the host. Copying it
-# off the host needs a destination the owner chooses (see docs/STAGING.md).
+# cache), and since 2026-09-28 the Bigtable emulator's volume (groups, group
+# change logs, settings/contacts sync records of the storage service). It is
+# a LOCAL snapshot on the same disk: it protects against an operator mistake
+# or a bad deploy, not against losing the host. Copying it off the host needs
+# a destination the owner chooses (see docs/STAGING.md).
 #
 # Consistency: the chat server is stopped for the copy (about one minute,
 # users reconnect by themselves), so nothing writes while the volumes are
@@ -47,6 +49,16 @@ for v in fdb-data minio-data redis-messages-data; do
   src=$(vol "$v")
   tar -C "$src" -czf "$out/$v.tgz" . && echo "$v: $(du -h "$out/$v.tgz" | cut -f1)"
 done
+
+# Bigtable emulator (storage service: groups, group logs, sync records): LevelDB
+# files, so the emulator is stopped for the copy (a few seconds; the storage
+# service reconnects by itself) and started again whatever happens.
+if docker volume inspect "${PROJECT}_bigtable-data" >/dev/null 2>&1; then
+  docker compose stop -t 10 bigtable >/dev/null 2>&1 && echo "bigtable stopped"
+  src=$(vol bigtable-data)
+  tar -C "$src" -czf "$out/bigtable-data.tgz" . && echo "bigtable-data: $(du -h "$out/bigtable-data.tgz" | cut -f1)"
+  docker compose start bigtable >/dev/null 2>&1 && echo "bigtable started"
+fi
 
 docker compose start chat >/dev/null 2>&1 && echo "chat started"
 

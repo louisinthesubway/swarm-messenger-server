@@ -1,7 +1,8 @@
 # SWARM Messenger staging server — runbook
 
 A self-hosted Signal-Server derivative on one Linux host. Registration, accounts, prekeys,
-profiles and messaging work. Every cloud dependency is replaced by a container on the same
+profiles and messaging work, and since 2026-09-28 groups and settings sync (Signal's separate
+storage service, section 5c). Every cloud dependency is replaced by a container on the same
 host, and every feature that needs an SGX enclave or a commercial account is switched off.
 
 Everything described here lives in [`deploy/staging/`](../deploy/staging). Deviations from
@@ -67,6 +68,8 @@ Internal to the Docker network `swarm-staging` (10.77.0.0/24), never published:
 | `minio:9000`, `minio:9001` | MinIO S3 API and console |
 | `tus:1080` | the CDN3 (TUS) upload service for attachments. Caddy publishes only `/upload/attachments` on it (section 8a) |
 | `registration-stub:8443` | the fixed-code registration stub, gRPC over TLS with a private CA |
+| `storage:8080`, `storage:8081` | the storage service (groups, settings sync) and its Dropwizard admin. Caddy publishes only `/v1/storage*` and `/v2/groups*` on it (section 5c) |
+| `bigtable:8086` | the Bigtable emulator the storage service keeps its tables in (gRPC) |
 
 The Redis clusters have static IPs on purpose: a Redis cluster advertises the address it
 believes it has, and Lettuce connects to whatever `CLUSTER SLOTS` returns. With dynamic
@@ -410,21 +413,173 @@ vault ("Opus M-H discovery") has the details.
 
 ---
 
-## 5c. Groups and settings sync need `signalapp/storage-service` (PROPOSED, not deployed)
+## 5c. Storage service and groups
 
-**Status: PROPOSED** (2026-09-27, Opus M-H, from reading the desktop and the upstream repository).
-Nothing in this section is deployed or tested on the staging host.
+**Status 2026-09-28 (Opus M6b): IMPLEMENTED and TESTED on the chat host.** Deployed 21:35-21:37
+UTC (`648786144` the services, `cd82a1619` the Caddy route and `storageService.uri`; service
+`louisinthesubway/swarm-storage-service` `08d0460`, docs `be6bbcf`). Tested 21:56-22:07 UTC
+with two desktop instances (swarm-main `e01c737c0`, fresh wallet accounts) against
+`chat.swarm.green`: settings sync writes its manifest
+(`PUT /v1/storage/ 200`), B set a username and A found it, A created a group with B
+(`PUT /v2/groups 200`), B saw it, one message each way in the group, both apps and the Bigtable
+emulator restarted, the group and its history were still there and one more message went each way.
+Proposed on 2026-09-27 by Opus M-H; the three options he listed are at the end of this section.
 
-### What fails today
+### What it is
 
-The desktop's `storageUrl` is `https://chat.swarm.green`, and the chat server (Signal-Server) does
-not serve Signal's storage API. Every storage call answers `404`:
+Signal keeps groups and the settings/contacts sync out of the chat server, in a second
+application: [`signalapp/storage-service`](https://github.com/signalapp/storage-service)
+(AGPL-3.0). SWARM runs a fork,
+[`louisinthesubway/swarm-storage-service`](https://github.com/louisinthesubway/swarm-storage-service)
+(branch `swarm-main`). Its two changes are listed in its `docs/SWARM-CHANGES.md`: the config file
+may use `${VAR}` placeholders filled from the environment, and the Bigtable client targets an
+emulator when `BIGTABLE_EMULATOR_HOST` is set. **No cryptography and no protocol code is
+changed**: group credentials are verified by upstream code with the chat server's own zkgroup
+secret.
 
-* **Groups.** `PUT /v2/groups` (create): after the group credentials verify, the desktop shows
-  "This group couldn't be created. Check your connection and try again." (seen 2026-09-27
-  22:16 UTC). Receiving, joining and changing groups use the same service.
-* **Settings and contacts sync.** `PUT /v1/storage/` and friends are logged as `404` on every
-  change; the app keeps working without them.
+Its only storage backend is Google Cloud Bigtable. This stack has no Google Cloud account and
+talks to no third party at runtime, so the service uses a Bigtable **emulator** whose tables are
+kept on disk: `cbtemulator` from [fullstorydev/emulators](https://github.com/fullstorydev/emulators)
+(MIT), a fork of Google's own `bttest` emulator with a LevelDB storage layer (`-dir`). Google's
+emulator (`gcloud beta emulators bigtable start`) keeps everything in memory and was not used for
+that reason.
+
+### The pieces
+
+| Piece | Where | Port | What it does |
+|---|---|---|---|
+| `bigtable` | image `swarm-messenger/bigtable:staging`, built by `bigtable/Dockerfile` from pinned sources (cbtemulator `5e109b8`, Google's `cbt` `fe593de`, base images by digest) | `bigtable:8086` (gRPC), not published | the four tables, as LevelDB files on the volume `bigtable-data` |
+| `bigtable-bootstrap` | same image, runs `bigtable/bootstrap-tables.sh` | one-shot | creates the tables and their column families with `cbt`; idempotent |
+| `storage` | image `swarm-messenger/storage-service:staging`, built by `storage/Dockerfile` from the fork's jar | `storage:8080` API, `storage:8081` Dropwizard admin, not published | the storage service |
+| Caddy | chat site block, `@storage` | `https://chat.swarm.green/v1/storage`, `/v1/storage/*`, `/v2/groups`, `/v2/groups/*`, **except** `GET /v1/storage/auth` | the public route (HTTP/1.1 to `storage:8080`) |
+| chat | `staging.yml` `storageService.uri: http://storage:8080` | | calls `DELETE /v1/storage` when an account is deleted; hands out the `/v1/storage` credentials on `GET /v1/storage/auth` |
+
+`GET /v1/storage/auth` stays with the chat server: it is the chat server's own endpoint
+(`SecureStorageController`) and issues the credentials the storage service then checks.
+
+### Configuration and secrets
+
+`deploy/staging/storage.yml` is the service's configuration (its own schema,
+`StorageServiceConfiguration`, not the chat server's). No secret is written in it: three values
+come from `storage.env`, which `storage/make-storage-env.sh` writes once on the host (mode 600,
+git-ignored, prints no secret), and the CDN key comes from `.env` through `docker-compose.yml`.
+
+| Key | Value | Why |
+|---|---|---|
+| `bigtable.projectId`, `bigtable.instanceId` | `swarm-staging` | labels; the emulator does not check them |
+| `bigtable.contactManifestsTableId` | `swarm_storage_manifests` (column family `m`) | settings/contacts sync manifests |
+| `bigtable.contactsTableId` | `swarm_storage_contacts` (family `c`) | settings/contacts sync records |
+| `bigtable.groupsTableId` | `swarm_storage_groups` (family `g`) | group state |
+| `bigtable.groupLogsTableId` | `swarm_storage_group_logs` (family `l`) | group change history |
+| `authentication.key` | `SWARM_STORAGE_AUTH_KEY_HEX` | the chat server's `storageService.userAuthenticationTokenSharedSecret`, the same 32 bytes written as hex (the chat server reads it as base64, this service as hex) |
+| `zkConfig.serverSecret` | `SWARM_STORAGE_ZK_SERVER_SECRET` | the chat server's `groupsZkConfig.serverSecret`, verbatim. The chat server issues group auth and profile key credentials with it and checks group send endorsements; this service checks the credentials and issues the endorsements |
+| `group.externalServiceSecret` | `SWARM_STORAGE_GROUP_CALL_SECRET_HEX` | 32 fresh random bytes, this service's own (group-call tokens) |
+| `group.maxGroupSize` | `1001` | = `groupsv2.groupSizeHardLimit` in `staging.yml` |
+| `group.maxGroupTitleLengthBytes` / `...DescriptionLengthBytes` | `1024` / `8192` | upstream's test-suite values |
+| `cdn.*` | `SWARM_CDN_ACCESS_KEY`, `SWARM_CDN_SECRET_KEY`, `SWARM_CDN_BUCKET`, `SWARM_AWS_REGION` from `.env` | group avatars: an S3 POST policy for `groups/<group id>/<random>`, signed with the CDN0 key |
+| `openTelemetry.enabled` | `false` | nothing is exported |
+| `BIGTABLE_EMULATOR_HOST` (environment, not a key) | `bigtable:8086` | set in `docker-compose.yml` |
+| `JAVA_TOOL_OPTIONS` | `-Xmx1g` | upstream's image asks for 8 GiB |
+
+A wrong `authentication.key` makes every `/v1/storage` call answer 401; a wrong
+`zkConfig.serverSecret` makes every group call answer 401. After rotating either secret in
+`staging-secrets.yml`: delete `storage.env`, run `./storage/make-storage-env.sh` again and
+`docker compose up -d storage`.
+
+### First install, and updating the service
+
+On the chat host, JDK 25 or newer on the PATH (the host has 26):
+
+```sh
+git clone https://github.com/louisinthesubway/swarm-storage-service /opt/swarm/swarm-storage-service
+(cd /opt/swarm/swarm-storage-service && ./mvnw -B -DskipTests package)   # about a minute
+
+cd /opt/swarm/swarm-messenger-server/deploy/staging
+./storage/make-storage-env.sh                     # once; leaves an existing storage.env alone
+./storage/prepare-image.sh /opt/swarm/swarm-storage-service   # jar + 180 runtime jars -> storage/build/
+docker compose build bigtable storage
+docker compose up -d storage                      # starts bigtable, runs bigtable-bootstrap, then storage
+```
+
+Then, once: `storageService.uri: http://storage:8080` in `staging.yml` and
+`docker compose restart chat`; the `@storage` route in `caddy/Caddyfile`, validated in a one-off
+container and reloaded:
+
+```sh
+docker compose --profile edge run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+docker compose --profile edge exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+Updating the service later touches only `storage`:
+
+```sh
+(cd /opt/swarm/swarm-storage-service && git pull --ff-only && ./mvnw -B -DskipTests package)
+./storage/prepare-image.sh /opt/swarm/swarm-storage-service
+docker compose build storage && docker compose up -d storage
+```
+
+### Checking it
+
+```sh
+docker compose ps bigtable storage            # both "healthy"
+docker compose logs bigtable-bootstrap        # "+ <table>" the first time, "= <table>" after
+curl -s -o /dev/null -w '%{http_code}\n' https://chat.swarm.green/v1/storage/manifest   # 401
+curl -s -o /dev/null -w '%{http_code}\n' https://chat.swarm.green/v2/groups             # 401
+# row counts, never contents:
+docker run --rm --network swarm-staging -e BIGTABLE_EMULATOR_HOST=bigtable:8086 \
+  --entrypoint cbt swarm-messenger/bigtable:staging \
+  -project swarm-staging -instance swarm-staging count swarm_storage_groups
+```
+
+`404` instead of `401` means the Caddy route is missing. The storage container's health check
+calls `/_ready`, which reads one row from each table on its first calls, so "healthy" also means
+it reaches its tables.
+
+In the desktop's log a working setup looks like this: `PUT (REST) https://chat.swarm.green/v2/groups
+200 Success`, `GET (REST) .../v2/groups/logs/0?... 200 Success`, `[groupSendEndorsements] ...
+Received endorsements`, `PUT (REST) https://chat.swarm.green/v1/storage/ 200 Success`,
+`[storage] upload(N): upload complete`. A brand-new account's first `GET /v1/storage/manifest`
+answers **404** and the app logs `sync(0): missing`: correct, it writes the first manifest right
+after.
+
+### What persists
+
+- The tables are LevelDB files on the Docker volume `swarm-messenger-staging_bigtable-data`. They
+  survive restarts of `bigtable` and `storage`, and `docker compose down` (not `down -v`).
+  Tested 2026-09-28: row counts identical before and after `docker compose restart bigtable`,
+  and both desktops read the group back afterwards.
+- The nightly snapshot (section 12) includes `bigtable-data.tgz` since 2026-09-28 (the emulator
+  is stopped for about a second while it is copied).
+- `storage` itself keeps nothing. `storage.env` holds the three secrets (section 9).
+- Caveat: an emulator is a test tool. One process, no replication, and LevelDB does not flush
+  every write to disk, so a crash of the host can lose the last few seconds. Fine for staging;
+  see "Towards something durable" below.
+
+### Reset: delete every group and every synced setting on the server
+
+```sh
+docker compose stop storage bigtable
+docker compose rm -f storage bigtable bigtable-bootstrap
+docker volume rm swarm-messenger-staging_bigtable-data
+docker compose up -d storage                      # empty tables again
+```
+
+Clients keep their local copies: every existing group becomes unusable (changes and endorsement
+refreshes fail) and has to be created again; settings sync uploads a fresh manifest by itself.
+
+### Known gaps
+
+- **Group photos.** Uploads reach MinIO (`cdn.chat.swarm.green` forwards the avatar POST, the
+  CDN key may write anywhere in the bucket), but the edge publishes reads only for
+  `/attachments/*` and `/profiles/*`, and the bucket's anonymous read policy covers only those
+  two prefixes, so members do not see a group photo. PROPOSED: add `/groups/*` to the `@read`
+  matcher of the `cdn.` block in `caddy/Caddyfile` and `arn:aws:s3:::swarm-cdn/groups/*` to the
+  anonymous policy in `minio/bootstrap-buckets.sh`. Not done.
+- **One host name for two services.** The desktop treats a 401 from `chat.swarm.green` as "we
+  might be unlinked" and reconnects its websocket, so a storage-service 401 (an expired
+  credential) causes one harmless reconnect. Upstream Signal uses a separate storage host.
+- **Group calls.** `GET /v2/groups/token` works, but there is no calling server (section 8).
+- `/v1/groups` (groups v1) is not routed; no current client uses it.
 
 ### What the desktop calls on `storageUrl`
 
@@ -442,51 +597,19 @@ From `STORAGE_CALLS` in `ts/textsecure/WebAPI.preload.ts`:
 | `v1/storage/read` | `PUT` | read records | same |
 | `v1/storage/` | `PUT` | write manifest + records | same |
 
-### What `signalapp/storage-service` is
+Every response from the storage service carries `X-Signal-Timestamp`. The desktop logs an error
+for a storage response without it and ignores such a response if it is a 403 (a front end that
+is not the service answered).
 
-Upstream, AGPL-3.0, a Dropwizard service (`GroupsController`, `GroupsV1Controller`,
-`StorageController`). Its configuration (`StorageServiceConfiguration`):
+### Towards something durable (from the 2026-09-27 proposal)
 
-* `bigtable`: `projectId`, `instanceId`, and four tables - `contactManifestsTableId`,
-  `contactsTableId`, `groupsTableId`, `groupLogsTableId`.
-* `authentication.key` (hex): the **same** secret as this server's
-  `storageService.userAuthenticationTokenSharedSecret`, or the `/v1/storage/auth` credentials do
-  not verify.
-* `zkConfig.serverSecret`: the **same** `ServerSecretParams` as this server's
-  `groupsZkConfig.serverSecret`, or no group credential verifies.
-* `cdn`: `accessKey`, `accessSecret`, `bucket`, `region` - S3 POST policies for group avatars.
-  MinIO can check those the way it already checks profile avatars (section 8a).
-* `group`: `maxGroupSize`, title/description byte limits, a 32-byte `externalServiceSecret` for
-  the group-call token, send-endorsement lifetimes.
-
-**Its only storage backend is Google Cloud Bigtable** (`BigtableDataClient` from
-`BigtableDataSettings.newBuilder()` with the project and instance above). Upstream's tests run
-against the in-memory Bigtable emulator (`BigtableEmulatorExtension`).
-
-### What a self-hosted SWARM deployment would need
-
-Three options, in order of effort:
-
-1. **Bigtable emulator (staging only).** Run the emulator in a container, create the four tables
-   and their column families at start, and point the service at it
-   (`BIGTABLE_EMULATOR_HOST`; check that the pinned client library honours it, or build the
-   settings with `newBuilderForEmulator`). **The emulator keeps everything in memory: every group
-   and every synced setting is lost when it restarts.** Good enough to prove groups end to end.
-2. **Cloud Bigtable.** Durable, but a Google Cloud account and a runtime dependency on a third
-   party, which this stack avoids everywhere else (section 1: "the stack contacts no third party at
-   runtime").
-3. **A SWARM fork of `storage-service` with its own table backend** - FoundationDB (already in the
-   stack) or a SQL store - implementing the four tables with the same conditional writes (manifest
-   version compare-and-set, group version checks, group-log range reads). The only durable,
-   self-hosted option, and the most work.
-
-In every option: route `/v1/storage/*` and `/v2/groups*` on `chat.swarm.green` to the service in
-the Caddyfile (or give it its own host name and change the clients' `storageUrl`), set this
-server's `storageService.uri`, wire the two shared secrets from `staging-secrets.yml`, and allow
-the group-avatar prefix in the CDN bucket policy.
-
-Recommendation: a separate milestone; option 1 to prove groups on staging, option 3 before anything
-real depends on groups.
+1. **A Bigtable emulator** - what runs now, with the on-disk variant.
+2. **Cloud Bigtable** - durable, but a Google Cloud account and a runtime dependency on a third
+   party, which this stack avoids everywhere else.
+3. **A SWARM fork of `storage-service` with its own table backend** (FoundationDB, already in the
+   stack, or SQL) implementing the four tables with the same conditional writes (manifest version
+   compare-and-set, group version checks, group-log range reads). The only durable, self-hosted
+   option, and the most work. PROPOSED before anything real depends on groups.
 
 ---
 
@@ -509,7 +632,13 @@ redis-pubsub            (healthy: PONG)
 registration-stub       (healthy: a CreateSession round trip over its own TLS)
   └─ chat               (healthy: GET :8081/healthcheck is 200)
        └─ caddy         (profile: edge)
+bigtable                (healthy: accepts connections on 8086)
+  └─ bigtable-bootstrap (creates the 4 tables + column families if missing, exits 0)
+       └─ storage       (healthy: GET :8080/_ready is 200, which reads each table once)
 ```
+
+`chat` does not wait for `storage`: it calls it only when an account is deleted, and clients
+reach it through Caddy, which resolves `storage` per request.
 
 Two of those one-shots are not optional in a subtle way:
 
@@ -567,6 +696,11 @@ docker compose exec tus node -e "fetch('http://127.0.0.1:1080/healthz').then(asy
 
 # the registration stub
 docker compose exec registration-stub python /app/healthcheck.py && echo STUB-OK
+
+# the storage service and its Bigtable emulator (section 5c)
+docker compose ps bigtable storage
+docker compose exec storage bash -c "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /_ready HTTP/1.0\r\n\r\n' >&3 && head -c 12 <&3"
+docker compose logs bigtable-bootstrap
 
 # everything at a glance
 docker compose ps
@@ -900,11 +1034,13 @@ Not covered, or not working:
 | **`deploy/staging/certs/`** | host filesystem | back up. Regenerating means editing `SWARM_REGISTRATION_CA_PEM` in `.env` and restarting `chat` |
 | **`deploy/staging/.env`** | host filesystem, mode 600 | back up. Contains the public zk half and the sealed-sender certificate, which must stay paired with the secrets |
 | `deploy/staging/tus.env` | host filesystem, mode 600 | back up, or recreate: `tus/make-tus-env.sh` copies the token secret from `staging-secrets.yml` again and makes a new MinIO key (then re-run `minio-bootstrap`) |
+| `deploy/staging/storage.env` | host filesystem, mode 600 | back up, or recreate: `storage/make-storage-env.sh` derives two of its three secrets from `staging-secrets.yml` again; the third (group-call tokens) is new, which only invalidates tokens already handed out |
 | `deploy/staging/shared/staging-public-params.json` | host filesystem | public, but regenerate-or-back-up: it is the record of what the clients were built against |
 | Accounts, keys, profiles, sessions | Docker volume `dynamodb-data` | `docker compose stop chat dynamodb && tar` the volume. DynamoDB Local is a single SQLite-ish file per table set |
 | Undelivered and stored messages | Docker volume `fdb-data` + `redis-messages-data` | `fdbbackup` for a consistent copy. For staging, stopping `chat` and tarring the volume is acceptable |
 | Attachments and avatars | Docker volume `minio-data` | `mc mirror` to another location |
 | Unfinished attachment uploads | Docker volume `tus-data` | not worth backing up: clients retry a failed send with a new upload form |
+| Groups, group change logs, settings/contacts sync records | Docker volume `bigtable-data` (LevelDB files of the Bigtable emulator) | in the nightly snapshot (section 12): stop `bigtable` for a second and tar the volume. Losing it breaks every existing group (section 5c, "Reset") |
 
 Nothing here is a supported disaster-recovery story. It is a staging stack: assume you can
 lose it and re-register the test accounts.
@@ -926,7 +1062,14 @@ lose it and re-register the test accounts.
 | Caddy cannot get a certificate | DNS does not point here yet, or 80/443 are blocked | fix DNS/firewall; use `acme_ca` staging while testing to avoid rate limits |
 | Registration returns 402 or 428 | a captcha or push challenge is required | send the captcha token `noop.noop.registration.noop` |
 | Desktop: **New group** turns the window blank; log says `Failed to parse global.groupsv2.maxGroupSize as an integer` | `remoteConfig.globalConfig` in `staging.yml` lacks the group size limits | set `groupsv2.maxGroupSize` and `groupsv2.groupSizeHardLimit` (without `global.`: the server adds that prefix), restart `chat`, reload the client |
-| Desktop: group creation says "This group couldn't be created"; `PUT /v2/groups 404` in its log | no groups (storage) service is deployed | expected; see section 5c |
+| Desktop: group creation says "This group couldn't be created"; `PUT /v2/groups 404` in its log | the request reached the chat server, not the storage service: the `@storage` route is missing from the running Caddy config | check `caddy/Caddyfile` (chat site block), validate and `caddy reload` (section 5c); `curl https://chat.swarm.green/v2/groups` must answer 401 |
+| Desktop: `PUT /v2/groups 502` (or `/v1/storage` 502) | `storage` is down or restarting | `docker compose ps storage bigtable`, `docker compose logs storage`; `docker compose up -d storage` |
+| Desktop: every `/v1/storage` call answers 401 although `GET /v1/storage/auth` was 200 | `SWARM_STORAGE_AUTH_KEY_HEX` in `storage.env` is not the chat server's `storageService.userAuthenticationTokenSharedSecret` | delete `storage.env`, `./storage/make-storage-env.sh`, `docker compose up -d storage` |
+| Desktop: every `/v2/groups` call answers 401 | `SWARM_STORAGE_ZK_SERVER_SECRET` is not the chat server's `groupsZkConfig.serverSecret` | same fix |
+| `storage` exits at start: `DecoderException`, `InvalidInputException` or an unresolved `${SWARM_STORAGE_...}` | `storage.env` is missing | `./storage/make-storage-env.sh`, then `docker compose up -d storage` |
+| `storage` unhealthy, its log shows `NOT_FOUND` for a `swarm_storage_*` table | the tables were never created in this emulator volume | `docker compose up bigtable-bootstrap` and read its output, then `docker compose restart storage` |
+| Desktop: a new account's first `GET /v1/storage/manifest` answers 404, log `sync(0): missing` | nothing stored for it yet | expected; the app writes the first manifest right after (`PUT /v1/storage/ 200`) |
+| A group photo does not show for the other members | reads of `groups/*` are not published on `cdn.chat.swarm.green` | known gap, section 5c |
 | An attachment spins forever; the client log shows a POST to `gcs.disabled.swarm.invalid` | the account got a CDN2 form: the `cdn3` experiment is missing from `s3://swarm-config/dynamic-config.yaml` | `docker compose up minio-bootstrap` (re-uploads `minio/dynamic-config.yaml`); the server re-reads it within 30 s |
 | `tus` answers 401 to every upload | `SWARM_TUS_TOKEN_SECRET` in `tus.env` is not `tus.userAuthenticationTokenSharedSecret` | fix `tus.env`, `docker compose up -d --no-deps tus` |
 | `tus` is unhealthy, `/healthz` says `S3 HEAD answered 403` | its MinIO user or policy is missing | `docker compose up minio-bootstrap`, then wait a minute (it re-probes) |
@@ -963,11 +1106,15 @@ docker compose logs foundationdb-init dynamodb-bootstrap minio-bootstrap
 `deploy/staging/backup-nightly.sh` runs from root's crontab at 04:10 UTC: it stops the chat
 container (about one minute; clients reconnect on their own), copies DynamoDB Local through
 sqlite3's online backup and tars the FoundationDB, MinIO and redis-messages volumes into
-`/root/backups/<UTC timestamp>/`, starts chat again and keeps seven days. Log:
+`/root/backups/<UTC timestamp>/`, and (since 2026-09-28) stops the Bigtable emulator for about a
+second to tar its volume as `bigtable-data.tgz` (groups and settings sync, section 5c), starts
+both again and keeps seven days. Log:
 `/root/backups/backup.log`. It is a snapshot on the same disk - it covers an operator mistake or
 a bad deploy, not the loss of the host; copying it elsewhere needs a destination the owner
 chooses (an object store or a second machine), which is still open.
 
 Restore, in outline: stop chat, copy the sqlite files back into the dynamodb volume and untar
-the three archives into their volumes, start chat. Test a restore on a throwaway copy of the
+the three archives into their volumes, start chat. For groups: `docker compose stop storage
+bigtable`, empty the `bigtable-data` volume, untar `bigtable-data.tgz` into it, start `bigtable`
+then `storage`. Test a restore on a throwaway copy of the
 stack before relying on it.
