@@ -957,3 +957,17 @@ docker compose logs foundationdb-init dynamodb-bootstrap minio-bootstrap
 - [ ] `health.delayedShutdownHandlerEnabled: true`.
 - [ ] Off-host backups of `staging-secrets.yml`, `certs/` and the data volumes.
 - [ ] A decision on PIN recovery: SVR needs SGX hardware, which a normal VPS does not have.
+
+## 12. Nightly snapshot of the data (since 2026-09-28)
+
+`deploy/staging/backup-nightly.sh` runs from root's crontab at 04:10 UTC: it stops the chat
+container (about one minute; clients reconnect on their own), copies DynamoDB Local through
+sqlite3's online backup and tars the FoundationDB, MinIO and redis-messages volumes into
+`/root/backups/<UTC timestamp>/`, starts chat again and keeps seven days. Log:
+`/root/backups/backup.log`. It is a snapshot on the same disk - it covers an operator mistake or
+a bad deploy, not the loss of the host; copying it elsewhere needs a destination the owner
+chooses (an object store or a second machine), which is still open.
+
+Restore, in outline: stop chat, copy the sqlite files back into the dynamodb volume and untar
+the three archives into their volumes, start chat. Test a restore on a throwaway copy of the
+stack before relying on it.
