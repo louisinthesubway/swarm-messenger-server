@@ -8,6 +8,9 @@ staging-secrets.yml
 # The CDN3 upload service's credentials (tus/make-tus-env.sh).
 tus.env
 tus.env.tmp
+# The storage service's credentials (storage/make-storage-env.sh).
+storage.env
+storage.env.tmp
 
 # Public, but deployment-specific: regenerated on every host, handed to the client builds by
 # hand rather than committed. See docs/STAGING.md ("Public parameters for the clients").
@@ -26,3 +29,5 @@ __pycache__/
 
 # Staged by prepare-image.sh: the jar and the FoundationDB client library the chat image copies.
 build/
+# Staged by storage/prepare-image.sh: the storage service jar and its dependencies.
+storage/build/

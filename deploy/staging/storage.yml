@@ -1,0 +1,79 @@
+# SWARM Messenger staging - configuration of the storage service (groups + settings/contacts
+# sync). Read docs/STAGING.md, section 5c "Storage service and groups", before changing anything.
+#
+# This is a different application from staging.yml: github.com/louisinthesubway/swarm-storage-service,
+# a fork of signalapp/storage-service, with its own configuration schema
+# (StorageServiceConfiguration). It does not read the chat server's secrets bundle (`secret://`).
+# Its StorageService.initialize() substitutes ${VAR} / ${VAR:-default} from the process
+# environment (docs/SWARM-CHANGES.md in that repository), and the `storage` container gets the
+# three secret values below from storage.env, which storage/make-storage-env.sh writes on the host
+# from staging-secrets.yml. Never commit values into this file.
+#
+# HOW THE VALUES WERE CHOSEN
+# -----------------------------------------------------------------------------------------------
+#   bigtable.*                  the Bigtable emulator on the compose network (`bigtable`; the
+#                               service finds it through BIGTABLE_EMULATOR_HOST, set in
+#                               docker-compose.yml). projectId/instanceId are labels the emulator
+#                               does not check; the four table ids are this deployment's
+#                               (swarm_ prefix, like the DynamoDB tables) and must match
+#                               bigtable/bootstrap-tables.sh, which creates them.
+#   authentication.key          hex of the chat server's storageService.userAuthenticationTokenSharedSecret:
+#                               the same 32 bytes, so the Basic credentials the chat server hands
+#                               out on GET /v1/storage/auth verify here.
+#   zkConfig.serverSecret       the chat server's groupsZkConfig.serverSecret, verbatim (base64
+#                               ServerSecretParams): group auth credentials and profile key
+#                               credentials issued by the chat server verify here, and the group
+#                               send endorsements issued here verify at the chat server.
+#   group.externalServiceSecret this service's own 32-byte secret for group-call tokens.
+#   group.maxGroupSize          1001 = staging.yml remoteConfig groupsv2.groupSizeHardLimit, the
+#                               hard limit clients are told.
+#   group.*LengthBytes          the values of upstream's own test suite (BaseGroupsControllerTest)
+#                               for the encrypted title and description; clients cap the plain
+#                               text well below them.
+#   cdn.*                       group avatars: an S3 POST policy for groups/<group id>/<random> in
+#                               the CDN bucket, signed with the CDN key the chat server uses for
+#                               profile avatars (values from .env through docker-compose.yml).
+#                               Uploads reach MinIO through cdn.chat.swarm.green's POST route;
+#                               DOWNLOADS of groups/* are not published yet (section 5c).
+#   openTelemetry               off: nothing is exported anywhere.
+
+server:
+  applicationConnectors:
+    - type: http
+      port: 8080
+  adminConnectors:
+    - type: http
+      port: 8081
+
+bigtable:
+  projectId: swarm-staging
+  instanceId: swarm-staging
+  contactManifestsTableId: swarm_storage_manifests
+  contactsTableId: swarm_storage_contacts
+  groupsTableId: swarm_storage_groups
+  groupLogsTableId: swarm_storage_group_logs
+
+authentication:
+  key: "${SWARM_STORAGE_AUTH_KEY_HEX}"
+
+zkConfig:
+  serverSecret: "${SWARM_STORAGE_ZK_SERVER_SECRET}"
+
+cdn:
+  accessKey: "${SWARM_CDN_ACCESS_KEY}"
+  accessSecret: "${SWARM_CDN_SECRET_KEY}"
+  bucket: "${SWARM_CDN_BUCKET:-swarm-cdn}"
+  region: "${SWARM_AWS_REGION:-us-east-1}"
+
+group:
+  maxGroupSize: 1001
+  maxGroupTitleLengthBytes: 1024
+  maxGroupDescriptionLengthBytes: 8192
+  externalServiceSecret: "${SWARM_STORAGE_GROUP_CALL_SECRET_HEX}"
+
+openTelemetry:
+  enabled: false
+  environment: swarm-staging
+  maxBucketCount: 100
+  logUrl: ""
+  maxBucketsPerMeter: {}

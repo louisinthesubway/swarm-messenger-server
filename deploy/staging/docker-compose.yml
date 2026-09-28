@@ -8,6 +8,8 @@
 #   Redis          pubsub            redis (standalone)
 #   S3             CDN + paged PQ    minio
 #   CDN3 uploads   attachments       ./tus (TUS 1.0.0 into the MinIO CDN bucket)
+#   Storage svc    groups + sync     ./storage (swarm-storage-service, a fork of signalapp/storage-service)
+#   Bigtable       its tables        ./bigtable (emulator, tables kept on disk)
 #   Registration   SMS verification  ./registration-stub (fixed code, staging only)
 #   TLS            public edge       caddy (profile: edge)
 #
@@ -39,6 +41,7 @@ volumes:
   dynamodb-data:
   minio-data:
   tus-data:
+  bigtable-data:
   caddy-data:
   caddy-config:
   redis-cache-data:
@@ -277,6 +280,48 @@ services:
     networks:
       - swarm
 
+  # ---------------------------------------------------------------- Bigtable emulator
+  # The storage service (below) keeps groups, group change logs, and the settings/contacts sync
+  # records in Bigtable, the only backend it has. No Google Cloud here: an emulator on the
+  # compose network, fullstorydev/emulators' cbtemulator (a fork of Google's bttest emulator)
+  # built from pinned source in bigtable/Dockerfile, with its tables in LevelDB on the
+  # `bigtable-data` volume, so groups survive a restart of this container. Google's own
+  # emulator would keep them in memory only. Not published on the host. docs/STAGING.md, 5c.
+  bigtable:
+    <<: *restart
+    build:
+      context: ./bigtable
+    image: swarm-messenger/bigtable:staging
+    hostname: bigtable
+    volumes:
+      - bigtable-data:/data
+    networks:
+      - swarm
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8086"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # One-shot: creates the storage service's four tables and their column families with `cbt`
+  # (same image). Idempotent; tables that exist on the volume are left alone.
+  bigtable-bootstrap:
+    build:
+      context: ./bigtable
+    image: swarm-messenger/bigtable:staging
+    restart: "no"
+    depends_on:
+      bigtable:
+        condition: service_healthy
+    environment:
+      BIGTABLE_EMULATOR_HOST: bigtable:8086
+    volumes:
+      - ./bigtable/bootstrap-tables.sh:/bootstrap-tables.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap-tables.sh"]
+    networks:
+      - swarm
+
   # ---------------------------------------------------------------- CDN3 attachment uploads
   # TUS 1.0.0 (creation-with-upload, HEAD, PATCH) for message attachments. Caddy sends
   # https://cdn.<domain>/upload/attachments here; the service checks the chat server's upload
@@ -408,6 +453,51 @@ services:
       timeout: 10s
       retries: 20
       start_period: 120s
+
+  # ---------------------------------------------------------------- storage service
+  # Groups (/v2/groups*) and settings/contacts sync (/v1/storage*): swarm-storage-service
+  # (github.com/louisinthesubway/swarm-storage-service), a fork of signalapp/storage-service.
+  # Caddy routes those two path families on the chat site here; the chat server itself only
+  # calls DELETE /v1/storage when an account is deleted (storageService.uri in staging.yml).
+  # Plain HTTP on the compose network, not published on the host. The image is built from a
+  # checkout of the fork: see storage/Dockerfile. The three secrets come from storage.env
+  # (storage/make-storage-env.sh); the CDN key for group avatars from .env. docs/STAGING.md, 5c.
+  storage:
+    <<: *restart
+    build:
+      context: ./storage
+    image: swarm-messenger/storage-service:staging
+    hostname: storage
+    depends_on:
+      bigtable-bootstrap:
+        condition: service_completed_successfully
+    # Optional so that other compose commands (the nightly backup's `stop chat`) never fail on a
+    # host that lacks it; without it the service itself refuses to start (unresolved ${...}).
+    env_file:
+      - path: storage.env
+        required: false
+    environment:
+      BIGTABLE_EMULATOR_HOST: bigtable:8086
+      SWARM_CDN_ACCESS_KEY: ${SWARM_CDN_ACCESS_KEY:-swarmcdn}
+      SWARM_CDN_SECRET_KEY: ${SWARM_CDN_SECRET_KEY:-}
+      SWARM_CDN_BUCKET: ${SWARM_CDN_BUCKET:-swarm-cdn}
+      SWARM_AWS_REGION: ${SWARM_AWS_REGION:-us-east-1}
+      # jib's -Xmx8192m is sized for Signal's production; staging needs far less.
+      JAVA_TOOL_OPTIONS: >-
+        -Xmx1g
+        -XX:HeapDumpPath=/tmp/heapdump.bin
+    volumes:
+      - ./storage.yml:/config/storage.yml:ro
+    networks:
+      - swarm
+    healthcheck:
+      # /_ready reads one row from each of the four tables on its first calls (upstream's
+      # warm-up), so "healthy" means the service is up AND reaches its tables.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /_ready HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
 
   # ---------------------------------------------------------------- TLS edge
   # Optional: `docker compose --profile edge up -d`. Terminates TLS for
