@@ -435,15 +435,22 @@ cdn3StorageManager:
     2: gcs
     3: r2
 
-# ---------------------------------------------------------------------------- disabled: calling
-# No TURN/SFU server yet. `urls` and `urlsWithIps` are @NotEmpty in
-# CloudflareTurnConfiguration, so they cannot be left empty; they name the planned
-# sfu.chat.swarm.green host. Voice and video calling is non-functional until an SFU and TURN
-# server exist there. No request is made to Cloudflare unless a client asks for credentials.
+# ---------------------------------------------------------------------------- calling: TURN (1:1)
+# SWARM (2026-09-29): one-to-one calls relay through coturn on this host (docker-compose.yml,
+# `coturn`; docs/STAGING.md, section 5d). This server version knows only Cloudflare's TURN
+# credential API, so `endpoint` points at `turn-credentials`, a service on the compose network that
+# answers in Cloudflare's shape (201, {"iceServers": {"username", "credential"}}) with coturn TURN
+# REST credentials, and only to this server's `apiToken` (staging-secrets.yml; the same value is
+# in turn.env). Nothing is sent to Cloudflare. On GET /v2/calling/relays clients get `urls`
+# verbatim and `urlsWithIps` with %s replaced by each address `hostname` resolves to: `turn:<ip>`
+# is UDP on 3478 (the default port of turn: URLs), `turn:<ip>:3478?transport=tcp` is TCP; both
+# are coturn's listener. Credentials are minted for requestedCredentialTtl and clients may cache
+# them for clientCredentialTtl. Group calls do not use this: they go to the SFU
+# (sfu.chat.swarm.green, the clients' own sfuUrl setting).
 turn:
   cloudflare:
     apiToken: secret://turn.cloudflare.apiToken
-    endpoint: https://turn.disabled.swarm.invalid/credentials/generate
+    endpoint: http://turn-credentials:8080/credentials/generate
     requestedCredentialTtl: PT24H
     clientCredentialTtl: PT12H
     urls:

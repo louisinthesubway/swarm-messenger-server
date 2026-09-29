@@ -155,6 +155,10 @@ svr2.userIdTokenSharedSecret: $(rand_b64_32)
 svrb.userAuthenticationTokenSharedSecret: $(rand_b64_32)
 svrb.userIdTokenSharedSecret: $(rand_b64_32)
 tus.userAuthenticationTokenSharedSecret: $(rand_b64_32)
+# The chat server's Bearer token for TURN credentials. The turn-credentials service (one-to-one
+# call relays, docs/STAGING.md section 5d) accepts only this token; coturn/make-turn-env.sh copies it
+# into turn.env.
+turn.cloudflare.apiToken: $(openssl rand -hex 32)
 
 tlsKeyStore.password: $(rand_b64_32)
 
@@ -164,7 +168,6 @@ stripe.idempotencyKeyGenerator: $(rand_b64_32)
 braintree.publicKey: unset
 braintree.privateKey: unset
 cdn3StorageManager.clientSecret: unset
-turn.cloudflare.apiToken: unset
 paymentsService.fixerApiKey: unset
 paymentsService.coinGeckoApiKey: unset
 hlrLookup.apiKey: unset
@@ -234,6 +237,7 @@ export ZK_CALLING_PRE_PUBLIC="${CALLING_PRE_PUBLIC}"
 export UD_ROOT_PUBLIC
 export SWARM_CHAT_DOMAIN="${SWARM_CHAT_DOMAIN:-chat.swarm.green}"
 export SWARM_CDN_DOMAIN="${SWARM_CDN_DOMAIN:-cdn.chat.swarm.green}"
+export SWARM_SFU_DOMAIN="${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}"
 python3 - "${GENERATED_AT}" > shared/staging-public-params.json <<'PY'
 import json, os, sys
 
@@ -253,7 +257,7 @@ doc = {
         "chatWebsocket": "wss://" + os.environ["SWARM_CHAT_DOMAIN"] + "/v1/websocket",
         "cdn": "https://" + os.environ["SWARM_CDN_DOMAIN"],
         "registration": None,
-        "sfu": None,
+        "sfu": "https://" + os.environ["SWARM_SFU_DOMAIN"],
     },
     "serverPublicParams": os.environ["ZK_GROUPS_PUBLIC"],
     "genericServerPublicParams": os.environ["ZK_CALLING_PUBLIC"],
@@ -277,7 +281,8 @@ doc = {
                                         "Public HTTPS uses Let's Encrypt.",
         "registration": "Deliberately null: reg.chat.swarm.green is not published. Clients "
                         "register through the chat endpoint.",
-        "sfu": "Deliberately null: no SFU or TURN server is deployed, so calling does not work.",
+        "sfu": "The group-call server (calling frontend). Clients take it from their own sfuUrl "
+               "setting; one-to-one call relays come from the chat server (/v2/calling/relays).",
     },
 }
 
@@ -291,6 +296,8 @@ chmod 644 shared/staging-public-params.json
 # The CDN3 upload service's own file: its copy of tus.userAuthenticationTokenSharedSecret and its
 # MinIO key (docs/STAGING.md, section 8a). Separate from .env on purpose.
 ./tus/make-tus-env.sh >/dev/null
+# The one-to-one call relay's file: the chat server's TURN token and coturn's secret (section 5d).
+./coturn/make-turn-env.sh >/dev/null
 
 cat <<EOF
 
@@ -299,6 +306,7 @@ cat <<EOF
   staging-secrets.yml                $(wc -l < staging-secrets.yml) lines, mode 600   PRIVATE, back it up
   .env                               $(wc -l < .env) lines, mode 600   PRIVATE
   tus.env                            the CDN3 upload service's credentials, mode 600   PRIVATE
+  turn.env                           the call relay's (coturn) secrets, mode 600       PRIVATE
   certs/                             internal CA + registration-stub certificate
   shared/staging-public-params.json  PUBLIC — give this to whoever builds the clients
 

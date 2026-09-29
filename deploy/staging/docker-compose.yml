@@ -11,6 +11,10 @@
 #   Storage svc    groups + sync     ./storage (swarm-storage-service, a fork of signalapp/storage-service)
 #   Bigtable       its tables        ./bigtable (emulator, tables kept on disk)
 #   Registration   SMS verification  ./registration-stub (fixed code, staging only)
+#   Cloudflare TURN  1:1 call relay  coturn (host network) + ./turn-credentials (Cloudflare's API shape)
+#   Calling svc    group calls (SFU) ./sfu: calling-backend (media, 10000) + calling-frontend
+#                                    (swarm-calling-service, a fork of signalapp/Signal-Calling-Service;
+#                                    call records in the dynamodb service, table from calling-bootstrap)
 #   TLS            public edge       caddy (profile: edge)
 #
 # Container images are pinned to the same tags/digests the upstream test suite uses
@@ -498,6 +502,171 @@ services:
       timeout: 10s
       retries: 20
       start_period: 60s
+
+  # ---------------------------------------------------------------- calls: TURN relay (1:1)
+  # coturn relays the media of a one-to-one call when the two clients cannot reach each other
+  # directly, and always when a client hides its IP address (the desktop does that for calls with
+  # someone who is not a contact yet, and for everyone with "Always relay calls"). HOST network:
+  # the relay ports are real host ports, without a docker-proxy per port or NAT in between. It
+  # listens on 64.95.11.180:3478 UDP+TCP, relays on 49160-49259/udp, has no TLS listener, and
+  # refuses to relay to loopback, private, link-local or Docker addresses (coturn/turnserver.conf).
+  # UFW must allow those ports: ufw-calls.sh. The static-auth-secret comes from turn.env
+  # (coturn/make-turn-env.sh) and is appended to a copy of the config in the container's tmpfs,
+  # so it is never on a command line. docs/STAGING.md, section 5d.
+  coturn:
+    <<: *restart
+    image: coturn/coturn:4.18.0-trixie@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
+    network_mode: host
+    env_file:
+      - path: turn.env
+        required: false
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    tmpfs:
+      # Owned by the image's user (nobody:nogroup), readable by nobody else: the config copy with
+      # the secret is written here.
+      - /var/lib/coturn:uid=65534,gid=65534,mode=700
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        : "$${SWARM_TURN_STATIC_AUTH_SECRET:?is not set: run ./coturn/make-turn-env.sh (docs/STAGING.md, 5d)}"
+        umask 077
+        { cat /etc/coturn/turnserver.conf; printf 'static-auth-secret=%s\n' "$$SWARM_TURN_STATIC_AUTH_SECRET"; } > /var/lib/coturn/turnserver.conf
+        exec turnserver -c /var/lib/coturn/turnserver.conf
+    healthcheck:
+      # A STUN binding request to the address coturn listens on (unauthenticated, like a client's).
+      test: ["CMD-SHELL", "turnutils_stunclient -p 3478 \"$$(sed -n 's/^listening-ip=//p' /etc/coturn/turnserver.conf)\" >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ---------------------------------------------------------------- calls: TURN credentials
+  # The chat server's TURN code knows only Cloudflare's credential API (POST {"ttl": n} with a
+  # Bearer token, 201 {"iceServers": {"username", "credential"}}), but its endpoint is
+  # configurable (turn.cloudflare.endpoint in staging.yml). This service answers in exactly that
+  # shape with coturn TURN REST credentials: username "<expiry>:<random>", credential
+  # base64(HMAC-SHA1(static-auth-secret, username)); any other token gets 401. Compose network
+  # only, not published. turn-credentials/server.mjs, docs/STAGING.md, section 5d.
+  turn-credentials:
+    <<: *restart
+    build:
+      context: ./turn-credentials
+    image: swarm-messenger/turn-credentials:staging
+    hostname: turn-credentials
+    env_file:
+      - path: turn.env
+        required: false
+    environment:
+      # Informational: the chat server hands clients its own turn.cloudflare URLs.
+      SWARM_TURN_URLS: turn:${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}:3478,turn:${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}:3478?transport=tcp
+    networks:
+      - swarm
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ---------------------------------------------------------------- calls: group calls (SFU)
+  # Signal's calling service, built from louisinthesubway/swarm-calling-service at a pinned commit
+  # (sfu/Dockerfile). Clients reach the frontend at https://sfu.chat.swarm.green (Caddy); it checks
+  # the group-call token the storage service signed (/v2/groups/token), keeps a call record in
+  # DynamoDB and puts the call on the backend, whose media port 10000 (UDP, and TCP for networks
+  # that block UDP) the clients then talk to directly. docs/STAGING.md, section 5d.
+
+  # One-shot: the frontend's table (swarm_calling_rooms) in the stack's DynamoDB Local. Idempotent.
+  calling-bootstrap:
+    image: amazon/aws-cli:2.31.11
+    restart: "no"
+    depends_on:
+      dynamodb:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: ${SWARM_AWS_ACCESS_KEY_ID:-swarmstaging}
+      AWS_SECRET_ACCESS_KEY: ${SWARM_AWS_SECRET_ACCESS_KEY:-swarmstaging}
+      AWS_DEFAULT_REGION: ${SWARM_AWS_REGION:-us-east-1}
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      CALLING_TABLE: swarm_calling_rooms
+    volumes:
+      - ./sfu/bootstrap-calling-table.sh:/bootstrap-calling-table.sh:ro
+    entrypoint: ["/bin/bash", "/bootstrap-calling-table.sh"]
+    networks:
+      - swarm
+
+  # The media server. Clients send ICE/SRTP to 64.95.11.180:10000; the frontend reaches its
+  # signaling API at http://10.77.0.31:8080. A fixed address, because the frontend asks the backend
+  # for its own address (/v1/info = --signaling-ip) and stores it in each call record.
+  calling-backend:
+    <<: *restart
+    build:
+      context: ./sfu
+      target: backend
+    image: swarm-messenger/calling-backend:staging
+    hostname: calling-backend
+    command:
+      - --binding-ip=0.0.0.0
+      - --ice-candidate-ip=64.95.11.180
+      - --ice-candidate-port=10000
+      - --ice-candidate-port-tcp=10000
+      - --signaling-ip=10.77.0.31
+      - --signaling-port=8080
+      - --max-clients-per-call=16
+      - --diagnostics-interval-secs=30
+      - --approved-users-persistence-url=http://calling-frontend:8100/v1/call-link-approvals
+      - --remove-call-records-base-url=http://calling-frontend:8100/v2/conference
+    ports:
+      - "10000:10000/udp"
+      - "10000:10000/tcp"
+    networks:
+      swarm:
+        ipv4_address: 10.77.0.31
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+
+  # The HTTP API the clients call (PUT/GET /v2/conference/participants, /v1/call-link). Its two
+  # secrets come from sfu.env (sfu/make-sfu-env.sh) through the environment, not the command line.
+  calling-frontend:
+    <<: *restart
+    build:
+      context: ./sfu
+      target: frontend
+    image: swarm-messenger/calling-frontend:staging
+    hostname: calling-frontend
+    depends_on:
+      calling-bootstrap:
+        condition: service_completed_successfully
+      calling-backend:
+        condition: service_healthy
+    env_file:
+      - path: sfu.env
+        required: false
+    command:
+      - --region=swarm-staging
+      - --version=141
+      - --max-clients-per-call=16
+      - --cleanup-interval-ms=30000
+      - --regional-url-template=https://${SWARM_SFU_DOMAIN:-sfu.chat.swarm.green}
+      - --calling-server-url=http://calling-backend:8080
+      - --storage-table=swarm_calling_rooms
+      - --storage-region=${SWARM_AWS_REGION:-us-east-1}
+      # Upstream's "testing" switch for a local DynamoDB: fixed dummy keys, this endpoint.
+      - --storage-endpoint=http://dynamodb:8000
+      - --internal-api-port=8100
+    networks:
+      - swarm
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
 
   # ---------------------------------------------------------------- TLS edge
   # Optional: `docker compose --profile edge up -d`. Terminates TLS for

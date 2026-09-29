@@ -11,6 +11,14 @@ tus.env.tmp
 # The storage service's credentials (storage/make-storage-env.sh).
 storage.env
 storage.env.tmp
+# Calls: the TURN relay's secrets (coturn/make-turn-env.sh) and the calling frontend's
+# (sfu/make-sfu-env.sh). make-turn-env.sh also leaves a staging-secrets.yml.XXXXXX copy behind
+# only if it is interrupted.
+turn.env
+turn.env.tmp
+sfu.env
+sfu.env.tmp
+staging-secrets.yml.??????
 
 # Public, but deployment-specific: regenerated on every host, handed to the client builds by
 # hand rather than committed. See docs/STAGING.md ("Public parameters for the clients").

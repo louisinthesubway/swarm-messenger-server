@@ -2,7 +2,7 @@
 #
 # Start with:  docker compose --profile edge up -d caddy
 #
-# Caddy gets certificates for the three public names from Let's Encrypt automatically, which
+# Caddy gets certificates for the public names from Let's Encrypt automatically, which
 # requires ports 80 and 443 reachable from the internet and the A/AAAA records already
 # pointing at this host. See docs/STAGING.md ("DNS") before starting it.
 #
@@ -199,6 +199,41 @@
 	log {
 		output stdout
 		format console
+	}
+}
+
+# ------------------------------------------------------------------ group calls (SFU)
+# SWARM (2026-09-29): the calling frontend (swarm-calling-service, a fork of Signal's calling
+# service; docs/STAGING.md, section 5d). Clients (RingRTC) look at and join a group call with
+# GET/PUT /v2/conference/participants and manage call links with /v1/call-link, authenticated with
+# the group-call token the storage service hands a member (GET /v2/groups/token). Only those two
+# paths are published; everything else answers 404 here. The media does not pass through Caddy:
+# clients send it to calling-backend on 64.95.11.180:10000 (UDP, or TCP). HTTP/1.1 to the frontend
+# on the compose network. Nothing there uses the client's address, so none is passed on, and the
+# access log keeps no address and no header (the Authorization header carries the token).
+{$SWARM_SFU_DOMAIN:sfu.chat.swarm.green} {
+	@calling path /v2/conference/participants /v1/call-link
+	handle @calling {
+		reverse_proxy calling-frontend:8080 {
+			header_up -X-Forwarded-For
+			header_up -X-Real-IP
+		}
+	}
+
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>remote_ip delete
+				request>client_ip delete
+				request>headers delete
+			}
+		}
 	}
 }
 
