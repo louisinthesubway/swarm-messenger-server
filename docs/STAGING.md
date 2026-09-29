@@ -591,7 +591,8 @@ after.
   before it is acknowledged; redundancy `single`, one process on one disk, as for the chat
   server's messages). They survive restarts of `storage` and `foundationdb`
   (rehearsed 2026-09-29 in throwaway containers: the data read back after a service restart).
-  The nightly snapshot already contains `fdb-data.tgz`; see "Known gaps" for its consistency.
+  The nightly snapshot contains them in `fdb-data.tgz`, copied with `foundationdb` stopped
+  (section 12).
 - On the emulator (before the switch): the tables are LevelDB files on the Docker volume
   `swarm-messenger-staging_bigtable-data`. They survive restarts of `bigtable` and `storage`, and
   `docker compose down` (not `down -v`). Tested 2026-09-28: row counts identical before and after
@@ -784,15 +785,12 @@ existing `/profiles/` object still 200, and paths outside the three prefixes 404
 - **Group calls** work since 2026-09-29: the calling frontend checks the token from
   `GET /v2/groups/token` with this service's `group.externalServiceSecret` (section 5d).
 - `/v1/groups` (groups v1) is not routed; no current client uses it.
-- **Nightly snapshot on FoundationDB.** Since 2026-09-29 `backup-nightly.sh` stops `storage` as
-  well as `chat` while it tars `fdb-data` (both write to it) and starts again whichever of them
-  was running whatever happens, so groups and settings sync pause for the same minute as chat.
-  A service an operator stopped before 04:10 UTC stays stopped. `fdbserver` itself
-  keeps running during the tar, as it always has for the chat server's data, and it keeps
-  writing its own files: the first nightly run (2026-09-29 04:10 UTC) logged `tar: ./storage-
-  ....sqlite: file changed as we read it` for `fdb-data` (and so printed no `fdb-data:` line).
-  The copy is that of a running database's files, not a guaranteed-consistent backup. PROPOSED:
-  `fdbbackup`, or stop `foundationdb` too for the tar (chat and storage are down then anyway).
+- **Nightly snapshot on FoundationDB: consistent since 2026-09-29.** The first nightly run
+  (04:10 UTC) tarred `fdb-data` while `fdbserver` ran, and tar reported `file changed as we read
+  it`: FoundationDB keeps writing its own files even with no client. `backup-nightly.sh` now
+  stops `chat` and `storage`, then `foundationdb` for the `fdb-data` tar only, and starts
+  everything again (FoundationDB first, waiting until the database is available) whatever
+  happens; see section 12. Groups and settings sync pause for the same minute as chat.
 - **Size ceiling on FoundationDB.** One record (a group state, a log entry, a manifest, an item)
   can be at most about 9.9 MB, FoundationDB's 10 MB transaction limit; the largest group the
   validators allow is about 0.96 MB and its largest log entry about 1.7 MB (fork's
@@ -1534,10 +1532,10 @@ Not covered, or not working:
 | `deploy/staging/storage.env` | host filesystem, mode 600 | back up, or recreate: `storage/make-storage-env.sh` derives two of its three secrets from `staging-secrets.yml` again; the third (group-call tokens) is new, which only invalidates tokens already handed out |
 | `deploy/staging/shared/staging-public-params.json` | host filesystem | public, but regenerate-or-back-up: it is the record of what the clients were built against |
 | Accounts, keys, profiles, sessions | Docker volume `dynamodb-data` | `docker compose stop chat dynamodb && tar` the volume. DynamoDB Local is a single SQLite-ish file per table set |
-| Undelivered and stored messages | Docker volume `fdb-data` + `redis-messages-data` | `fdbbackup` for a consistent copy. For staging, stopping `chat` and tarring the volume is acceptable |
+| Undelivered and stored messages | Docker volume `fdb-data` + `redis-messages-data` | in the nightly snapshot (section 12): `fdb-data` is tarred with `foundationdb` stopped (chat and storage stopped too), so the copy is consistent. `fdbbackup` would give a copy without stopping anything |
 | Attachments and avatars | Docker volume `minio-data` | `mc mirror` to another location |
 | Unfinished attachment uploads | Docker volume `tus-data` | not worth backing up: clients retry a failed send with a new upload form |
-| Groups, group change logs, settings/contacts sync records | Docker volume `bigtable-data` (LevelDB files of the Bigtable emulator); after the switch to FoundationDB (section 5c) `fdb-data`, directory `swarm-storage-service` | in the nightly snapshot (section 12): stop `bigtable` for a second and tar the volume; after the switch they are in `fdb-data.tgz` (consistency: section 5c, "Known gaps"). Losing them breaks every existing group (section 5c, "Reset") |
+| Groups, group change logs, settings/contacts sync records | Docker volume `bigtable-data` (LevelDB files of the Bigtable emulator); after the switch to FoundationDB (section 5c) `fdb-data`, directory `swarm-storage-service` | in the nightly snapshot (section 12): stop `bigtable` for a second and tar the volume; after the switch they are in `fdb-data.tgz`. Losing them breaks every existing group (section 5c, "Reset") |
 | `deploy/staging/turn.env` | host filesystem, mode 600 | back up, or recreate with `coturn/make-turn-env.sh` (section 5d, rotation): clients fetch new relay credentials by themselves |
 | `deploy/staging/sfu.env` | host filesystem, mode 600 | recreate with `sfu/make-sfu-env.sh`: both values are copies of secrets in `storage.env` and `staging-secrets.yml` |
 | Active group calls and call links | DynamoDB table `swarm_calling_rooms` in the `dynamodb-data` volume | part of the DynamoDB copy in the nightly snapshot. Losing it ends calls in progress and every call link |
@@ -1617,11 +1615,21 @@ docker compose logs foundationdb-init dynamodb-bootstrap minio-bootstrap
 
 `deploy/staging/backup-nightly.sh` runs from root's crontab at 04:10 UTC: it stops the chat
 and storage containers (about one minute; clients reconnect on their own; since 2026-09-29 the
-storage service's data is in FoundationDB too), copies DynamoDB Local through
-sqlite3's online backup and tars the FoundationDB, MinIO and redis-messages volumes into
-`/root/backups/<UTC timestamp>/`, and (since 2026-09-28) stops the Bigtable emulator for about a
-second to tar its volume as `bigtable-data.tgz` (groups and settings sync until the switch to
-FoundationDB, section 5c), starts everything again and keeps seven days. Log:
+storage service's data is in FoundationDB too) and copies DynamoDB Local through sqlite3's online
+backup; it stops `foundationdb` too (since 2026-09-29), tars `fdb-data` and starts it again
+right away, waiting until `fdbcli` reports the database available; it tars the MinIO and
+redis-messages volumes, and (since 2026-09-28) stops the Bigtable emulator for about a second to
+tar its volume as `bigtable-data.tgz` (groups and settings sync until the switch to
+FoundationDB, section 5c); then it starts chat and storage again and keeps seven days, all into
+`/root/backups/<UTC timestamp>/`. Whatever ran before is started again whatever happens (also
+from an EXIT trap), FoundationDB first. Every archive is listed with its size, and a tar that
+saw a file change prints `(tar exit 1)` next to it. Why stop FoundationDB rather than use
+`fdbbackup`: chat and storage are stopped for the copy anyway, so stopping `fdbserver` only adds
+its restart (seconds) to the same minute, and a copy of a stopped server's files is what
+FoundationDB itself recovers from after any stop, so restoring stays "untar into the volume";
+`fdbbackup` would need a `backup_agent` process and a destination mounted into it for every
+backup, and `fdbrestore` with agents for every restore, to avoid a pause that happens anyway.
+Log:
 `/root/backups/backup.log`. It is a snapshot on the same disk - it covers an operator mistake or
 a bad deploy, not the loss of the host; copying it elsewhere needs a destination the owner
 chooses (an object store or a second machine), which is still open.
