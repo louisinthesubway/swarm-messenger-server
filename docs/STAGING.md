@@ -440,13 +440,12 @@ Proposed on 2026-09-27 by Opus M-H; the three options he listed are at the end o
 
 **Group photos: IMPLEMENTED and TESTED 2026-09-29 (Opus M6d)**; see "Group photos" below.
 
-**Durable backend, FoundationDB: IMPLEMENTED and TESTED 2026-09-29 (Opus M6c), NOT DEPLOYED.**
-The fork keeps groups, group logs and the settings/contacts sync records in the stack's
-FoundationDB cluster when `storage.backend: foundationdb` (fork `swarm-main` `3f3b61b23`, PR #1,
-merged 2026-09-29; its `docs/SWARM-CHANGES.md` section 3). This repository's `storage.yml`,
-`docker-compose.yml` and `storage/` are set up for it. The live stack runs on the Bigtable
-emulator until someone follows
-"Switching to FoundationDB" below; the emulator stays as the migration's source until then.
+**Durable backend, FoundationDB: DEPLOYED 2026-09-29 04:12 UTC (Opus M6c), verified.**
+The service keeps groups, group logs and the settings/contacts sync records in the stack's
+FoundationDB cluster (`storage.backend: foundationdb`; fork `swarm-main` `316f78484`, PRs #1
+and #2 there; its `docs/SWARM-CHANGES.md` section 3), in the directory `swarm-storage-service`.
+The Bigtable emulator still runs, untouched since the switch, as the pre-switch copy; the planner
+removes it after the owner's test (step 9 of "Switching to FoundationDB").
 Tested: the fork's whole suite against a real FoundationDB 7.3.76 (CI and throwaway containers on
 the chat host), and the whole switch-over rehearsed in throwaway containers on the chat host with
 an image built from these files (details in that subsection).
@@ -587,7 +586,7 @@ after.
 
 ### What persists
 
-- On FoundationDB (after the switch): the records are in the chat server's cluster, volume
+- On FoundationDB (since 2026-09-29 04:12 UTC): the records are in the chat server's cluster, volume
   `fdb-data`, with FoundationDB's own durability (storage engine `ssd`, every commit on disk
   before it is acknowledged; redundancy `single`, one process on one disk, as for the chat
   server's messages). They survive restarts of `storage` and `foundationdb`
@@ -624,7 +623,27 @@ directory stays in the cluster, untouched, until someone removes it with the Dir
 
 ### Switching to FoundationDB
 
-**Status: runbook, NOT executed on the live stack.** Rehearsed 2026-09-29 (Opus M6c) in throwaway
+**Status: EXECUTED on the live stack 2026-09-29 (Opus M6c)**, after the first nightly snapshot
+(04:10 UTC, whose `bigtable-data.tgz` is the pre-switch copy). Image
+`swarm-messenger/storage-service:staging` = `sha256:16f8aa7b0184...` (fork `316f78484`; the old
+image stays tagged `pre-fdb-be6bbcf`). Step 3, dry run against the live cluster, read-only:
+groups 1, group-logs 2, storage-manifests 2, storage-items 11 rows, all "would copy"; the
+cluster had no Directory-layer keys before or after. Step 4 stopped storage at 04:12:10.9;
+step 5 `--apply` copied 1 / 2 / 2 / 11 (target after the same), a second `--apply` found all
+identical; step 6 healthy at 04:12:43.6 on FoundationDB. **Groups and settings sync were
+unavailable 04:12:10.9-04:12:43.6 UTC (about 33 s); chat was not affected.** Step 7 with the
+hidden test instances m6b-a/m6b-b: from outside `/v2/groups` and `/v1/storage/manifest` 401 with
+`X-Signal-Timestamp`; both apps read their manifests (`GET .../manifest/version/7` and `/5` 204),
+the group and its log (`GET /v2/groups/logs/1?includeFirstState=true... 200`, `GET
+/v2/groups/token 200`) with its history and photo, one message each way (delivered), two group
+changes (`PATCH /v2/groups 200`, description set and cleared, B followed), a settings change
+(pin, unpin: `PUT /v1/storage/ 200`, manifest 7 -> 8). Screens
+`D:/swarm-work/smoke/messenger-m6c-01..05-*.png` on the M6c workstation. From step 6 on the
+emulator is stale: **do not run `--apply` again** (it would copy back what clients have deleted
+since, e.g. a replaced settings record); a dry run now reports the newer FoundationDB records
+as conflicts, which is expected.
+
+Before that, rehearsed 2026-09-29 (Opus M6c) in throwaway
 containers on the chat host (own Docker network, nothing published, all removed afterwards): an
 image built with this `storage/Dockerfile` and `storage/prepare-image.sh` from the fork branch,
 the stack's own emulator image as the source. The service on the emulator wrote two 120 KB
@@ -637,17 +656,9 @@ alone; both groups read identically through both backends; the service started o
 for byte, accepted the next manifest version, refused a stale one with 409, and still had
 everything after a restart.
 
-**Step 1 done on the chat host, 2026-09-29 03:03 UTC (Opus M6c)**, nothing stopped or restarted:
-`/opt/swarm/swarm-storage-service` fast-forwarded to `3f3b61b23` and built; `prepare-image.sh` and
-`docker compose build storage` run from a scratch copy of this branch's `deploy/staging` (the live
-files untouched) gave `swarm-messenger/storage-service:staging` =
-`sha256:a379a3dc2c7ad45a75b5f0d13b0ff7348f9d9a3ad6e946ac9302073ac806cd6b`. The running container
-still uses the previous image, `sha256:b3a4560af760...`, which also carries the tag
-`swarm-messenger/storage-service:pre-fdb-be6bbcf` for a rollback. Until step 6, any
-`docker compose up -d storage` in the live directory would restart the service on the new image
-(new code, still on Bigtable with the old `storage.yml`). A dry run against the live emulator (its
-target a throwaway FoundationDB, see step 3) reported: groups 1, group-logs 2, storage-manifests 2,
-storage-items 11 rows, all "would copy", no conflicts, no unreadable rows.
+A first step 1 on 2026-09-29 03:03 UTC built `3f3b61b23` (`sha256:a379a3dc2c7a...`, unused, and
+the old image got its `pre-fdb-be6bbcf` tag then); its dry run against the live emulator, with a
+throwaway FoundationDB as the target, reported the same counts as step 3 later did.
 
 Groups and settings sync are unavailable from step 4 to step 6 (a minute or two); chat and
 messages are not affected.
@@ -773,11 +784,15 @@ existing `/profiles/` object still 200, and paths outside the three prefixes 404
 - **Group calls** work since 2026-09-29: the calling frontend checks the token from
   `GET /v2/groups/token` with this service's `group.externalServiceSecret` (section 5d).
 - `/v1/groups` (groups v1) is not routed; no current client uses it.
-- **Nightly snapshot on FoundationDB.** `backup-nightly.sh` stops `chat`, not `storage`, while it
-  tars `fdb-data`, and `fdbserver` keeps running during the tar (as before the switch, for the
-  chat server's own data). After the switch the storage service can write during the copy, so the
-  snapshot of those records is only as consistent as a copy of a running database's files.
-  PROPOSED: stop `storage` too for the copy, or use `fdbbackup`. The script is unchanged here.
+- **Nightly snapshot on FoundationDB.** Since 2026-09-29 `backup-nightly.sh` stops `storage` as
+  well as `chat` while it tars `fdb-data` (both write to it) and starts again whichever of them
+  was running whatever happens, so groups and settings sync pause for the same minute as chat.
+  A service an operator stopped before 04:10 UTC stays stopped. `fdbserver` itself
+  keeps running during the tar, as it always has for the chat server's data, and it keeps
+  writing its own files: the first nightly run (2026-09-29 04:10 UTC) logged `tar: ./storage-
+  ....sqlite: file changed as we read it` for `fdb-data` (and so printed no `fdb-data:` line).
+  The copy is that of a running database's files, not a guaranteed-consistent backup. PROPOSED:
+  `fdbbackup`, or stop `foundationdb` too for the tar (chat and storage are down then anyway).
 - **Size ceiling on FoundationDB.** One record (a group state, a log entry, a manifest, an item)
   can be at most about 9.9 MB, FoundationDB's 10 MB transaction limit; the largest group the
   validators allow is about 0.96 MB and its largest log entry about 1.7 MB (fork's
@@ -811,8 +826,8 @@ is not the service answered).
 3. **A SWARM fork of `storage-service` with its own table backend** (FoundationDB, already in the
    stack, or SQL) implementing the four tables with the same conditional writes (manifest version
    compare-and-set, group version checks, group-log range reads). The only durable, self-hosted
-   option, and the most work. **IMPLEMENTED and TESTED 2026-09-29 (Opus M6c) on FoundationDB;
-   NOT DEPLOYED**: see the status at the top of this section and "Switching to FoundationDB".
+   option, and the most work. **DEPLOYED 2026-09-29 04:12 UTC (Opus M6c) on FoundationDB**: see
+   the status at the top of this section and "Switching to FoundationDB".
 
 ---
 
@@ -1601,17 +1616,20 @@ docker compose logs foundationdb-init dynamodb-bootstrap minio-bootstrap
 ## 12. Nightly snapshot of the data (since 2026-09-28)
 
 `deploy/staging/backup-nightly.sh` runs from root's crontab at 04:10 UTC: it stops the chat
-container (about one minute; clients reconnect on their own), copies DynamoDB Local through
+and storage containers (about one minute; clients reconnect on their own; since 2026-09-29 the
+storage service's data is in FoundationDB too), copies DynamoDB Local through
 sqlite3's online backup and tars the FoundationDB, MinIO and redis-messages volumes into
 `/root/backups/<UTC timestamp>/`, and (since 2026-09-28) stops the Bigtable emulator for about a
-second to tar its volume as `bigtable-data.tgz` (groups and settings sync, section 5c), starts
-both again and keeps seven days. Log:
+second to tar its volume as `bigtable-data.tgz` (groups and settings sync until the switch to
+FoundationDB, section 5c), starts everything again and keeps seven days. Log:
 `/root/backups/backup.log`. It is a snapshot on the same disk - it covers an operator mistake or
 a bad deploy, not the loss of the host; copying it elsewhere needs a destination the owner
 chooses (an object store or a second machine), which is still open.
 
-Restore, in outline: stop chat, copy the sqlite files back into the dynamodb volume and untar
-the three archives into their volumes, start chat. For groups: `docker compose stop storage
-bigtable`, empty the `bigtable-data` volume, untar `bigtable-data.tgz` into it, start `bigtable`
-then `storage`. Test a restore on a throwaway copy of the
+Restore, in outline: stop chat and storage, copy the sqlite files back into the dynamodb volume
+and untar the three archives into their volumes (for `fdb-data` with `foundationdb` stopped too),
+start them again. Since 2026-09-29 groups and settings sync come back with `fdb-data`;
+`bigtable-data.tgz` is the emulator's (pre-switch) copy: `docker compose stop storage bigtable`,
+empty the `bigtable-data` volume, untar it, start `bigtable`, then `storage` with
+`storage.backend: bigtable` (5c, rollback). Test a restore on a throwaway copy of the
 stack before relying on it.
