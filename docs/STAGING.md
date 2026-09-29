@@ -74,7 +74,7 @@ Internal to the Docker network `swarm-staging` (10.77.0.0/24), never published:
 | `tus:1080` | the CDN3 (TUS) upload service for attachments. Caddy publishes only `/upload/attachments` on it (section 8a) |
 | `registration-stub:8443` | the fixed-code registration stub, gRPC over TLS with a private CA |
 | `storage:8080`, `storage:8081` | the storage service (groups, settings sync) and its Dropwizard admin. Caddy publishes only `/v1/storage*` and `/v2/groups*` on it (section 5c) |
-| `bigtable:8086` | the Bigtable emulator the storage service keeps its tables in (gRPC) |
+| `bigtable:8086` | the Bigtable emulator (gRPC): the storage service's tables until its switch to FoundationDB (section 5c), then only the migration's source |
 | `turn-credentials:8080` | TURN credentials in Cloudflare's API shape, for the chat server only (section 5d) |
 | `calling-frontend:8080`, `:8100` | the calling service's client API (Caddy publishes `/v2/conference/participants` and `/v1/call-link` on `sfu.`) and its internal API for the backend |
 | `10.77.0.31:8080` | `calling-backend`'s signaling API, for the frontend (fixed address: the frontend stores it in each call record) |
@@ -442,9 +442,10 @@ Proposed on 2026-09-27 by Opus M-H; the three options he listed are at the end o
 
 **Durable backend, FoundationDB: IMPLEMENTED and TESTED 2026-09-29 (Opus M6c), NOT DEPLOYED.**
 The fork keeps groups, group logs and the settings/contacts sync records in the stack's
-FoundationDB cluster when `storage.backend: foundationdb` (fork branch `codex/m6c-fdb-backend`,
-its `docs/SWARM-CHANGES.md` section 3). This repository's `storage.yml`, `docker-compose.yml` and
-`storage/` are set up for it. The live stack runs on the Bigtable emulator until someone follows
+FoundationDB cluster when `storage.backend: foundationdb` (fork `swarm-main` `3f3b61b23`, PR #1,
+merged 2026-09-29; its `docs/SWARM-CHANGES.md` section 3). This repository's `storage.yml`,
+`docker-compose.yml` and `storage/` are set up for it. The live stack runs on the Bigtable
+emulator until someone follows
 "Switching to FoundationDB" below; the emulator stays as the migration's source until then.
 Tested: the fork's whole suite against a real FoundationDB 7.3.76 (CI and throwaway containers on
 the chat host), and the whole switch-over rehearsed in throwaway containers on the chat host with
@@ -456,11 +457,11 @@ Signal keeps groups and the settings/contacts sync out of the chat server, in a 
 application: [`signalapp/storage-service`](https://github.com/signalapp/storage-service)
 (AGPL-3.0). SWARM runs a fork,
 [`louisinthesubway/swarm-storage-service`](https://github.com/louisinthesubway/swarm-storage-service)
-(branch `swarm-main`). Its two changes are listed in its `docs/SWARM-CHANGES.md`: the config file
-may use `${VAR}` placeholders filled from the environment, and the Bigtable client targets an
-emulator when `BIGTABLE_EMULATOR_HOST` is set. **No cryptography and no protocol code is
-changed**: group credentials are verified by upstream code with the chat server's own zkgroup
-secret.
+(branch `swarm-main`). Its changes are listed in its `docs/SWARM-CHANGES.md`: the config file
+may use `${VAR}` placeholders filled from the environment, the Bigtable client targets an
+emulator when `BIGTABLE_EMULATOR_HOST` is set, and a FoundationDB backend (below). **No
+cryptography and no protocol code is changed**: group credentials are verified by upstream code
+with the chat server's own zkgroup secret.
 
 Upstream's only storage backend is Google Cloud Bigtable. This stack has no Google Cloud account
 and talks to no third party at runtime, so the service first ran on a Bigtable **emulator** whose
@@ -573,8 +574,9 @@ calls `/_ready`, which reads one row (FoundationDB: one key-value) from each of 
 its first calls, so "healthy" also means it reaches its data. On FoundationDB the start log says
 `FoundationDB storage backend: cluster file /etc/foundationdb/fdb.cluster, directory
 [swarm-storage-service], client 7.3.76 (API 730)`. While the emulator still exists, a dry run of the
-migration prints the record counts on both sides and changes nothing:
+migration prints the record counts on both sides:
 `docker compose run --rm --no-deps storage migrate-bigtable-to-foundationdb /config/storage.yml`.
+It never writes to the emulator; on FoundationDB see the note under step 3 below.
 
 In the desktop's log a working setup looks like this: `PUT (REST) https://chat.swarm.green/v2/groups
 200 Success`, `GET (REST) .../v2/groups/logs/0?... 200 Success`, `[groupSendEndorsements] ...
@@ -635,6 +637,18 @@ alone; both groups read identically through both backends; the service started o
 for byte, accepted the next manifest version, refused a stale one with 409, and still had
 everything after a restart.
 
+**Step 1 done on the chat host, 2026-09-29 03:03 UTC (Opus M6c)**, nothing stopped or restarted:
+`/opt/swarm/swarm-storage-service` fast-forwarded to `3f3b61b23` and built; `prepare-image.sh` and
+`docker compose build storage` run from a scratch copy of this branch's `deploy/staging` (the live
+files untouched) gave `swarm-messenger/storage-service:staging` =
+`sha256:a379a3dc2c7ad45a75b5f0d13b0ff7348f9d9a3ad6e946ac9302073ac806cd6b`. The running container
+still uses the previous image, `sha256:b3a4560af760...`, which also carries the tag
+`swarm-messenger/storage-service:pre-fdb-be6bbcf` for a rollback. Until step 6, any
+`docker compose up -d storage` in the live directory would restart the service on the new image
+(new code, still on Bigtable with the old `storage.yml`). A dry run against the live emulator (its
+target a throwaway FoundationDB, see step 3) reported: groups 1, group-logs 2, storage-manifests 2,
+storage-items 11 rows, all "would copy", no conflicts, no unreadable rows.
+
 Groups and settings sync are unavailable from step 4 to step 6 (a minute or two); chat and
 messages are not affected.
 
@@ -642,7 +656,7 @@ messages are not affected.
    container:
 
    ```sh
-   cd /opt/swarm/swarm-storage-service && git fetch && git checkout <reviewed commit>
+   cd /opt/swarm/swarm-storage-service && git pull --ff-only && git log --oneline -1   # 3f3b61b23 or a later reviewed commit
    ./mvnw -B -DskipTests package                    # downloads libfdb_c.so 7.3.76, checks its SHA-256
    cd /opt/swarm/swarm-messenger-server/deploy/staging
    ./storage/prepare-image.sh /opt/swarm/swarm-storage-service   # prints the libfdb_c.so sha256: af099848...
@@ -652,10 +666,16 @@ messages are not affected.
 2. **Bring the host's `docker-compose.yml`, `storage.yml` and `storage/` to this branch's
    version** (the host's working tree carries local changes: check `git status` and `git diff`
    for these files first). Nothing restarts yet.
-3. **Dry run** while the old service still serves (it only reads):
+3. **Dry run** while the old service still serves (it never writes to the emulator):
    `docker compose run --rm --no-deps storage migrate-bigtable-to-foundationdb /config/storage.yml`.
    Expect `target before` 0 everywhere, `would copy` equal to `source rows`, no conflicts, no
-   unreadable rows, and `OK:` at the end.
+   unreadable rows, and `OK:` at the end. On FoundationDB: from fork
+   [PR #2](https://github.com/louisinthesubway/swarm-storage-service/pull/2) on, the dry run opens
+   its directory read-only and writes nothing; at `3f3b61b23` it opens it with `createOrOpen`, so
+   the first dry run creates the
+   service's empty directory in the chat server's cluster (the service creates it at start anyway,
+   and nothing else in the cluster is touched). The live cluster had no Directory-layer data at all
+   on 2026-09-29 (`fdbcli --exec 'getrangekeys \xfe \xff 10'` lists nothing).
 4. **Stop** the service: `docker compose stop storage`.
 5. **Migrate**:
    `docker compose run --rm --no-deps storage migrate-bigtable-to-foundationdb --apply /config/storage.yml`.

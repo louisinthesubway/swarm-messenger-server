@@ -2,14 +2,14 @@
 #
 # Every cloud dependency of upstream Signal-Server is replaced with a local equivalent:
 #
-#   FoundationDB   messages          foundationdb/foundationdb (single, ssd)
+#   FoundationDB   messages, groups  foundationdb/foundationdb (single, ssd); groups + sync in the storage service's own directory
 #   DynamoDB       accounts/keys/... amazon/dynamodb-local
 #   Redis clusters cache/rate/...    redis:7.4-alpine, one single-node cluster per role (redis/single-node-cluster.sh)
 #   Redis          pubsub            redis (standalone)
 #   S3             CDN + paged PQ    minio
 #   CDN3 uploads   attachments       ./tus (TUS 1.0.0 into the MinIO CDN bucket)
 #   Storage svc    groups + sync     ./storage (swarm-storage-service, a fork of signalapp/storage-service)
-#   Bigtable       its tables        ./bigtable (emulator, tables kept on disk)
+#   Bigtable       migration source  ./bigtable (emulator; its tables are copied into FoundationDB once, then it goes)
 #   Registration   SMS verification  ./registration-stub (fixed code, staging only)
 #   Cloudflare TURN  1:1 call relay  coturn (host network) + ./turn-credentials (Cloudflare's API shape)
 #   Calling svc    group calls (SFU) ./sfu: calling-backend (media, 10000) + calling-frontend
