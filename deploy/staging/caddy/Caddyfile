@@ -121,17 +121,19 @@
 
 # ------------------------------------------------------------------ attachments / CDN
 # Objects live in the MinIO bucket swarm-cdn; clients never see the bucket name. Contract and
-# runbook: docs/STAGING.md, section 8a.
+# runbook: docs/STAGING.md, section 8a (group photos: section 5c).
 #
 #   POST PATCH HEAD OPTIONS  /upload/attachments[/<key>]   CDN3 (TUS) attachment uploads -> tus,
 #                                                          which checks the chat server's upload
 #                                                          token on every request
 #   POST multipart/form-data /                             CDN0 avatar uploads (an S3 POST
-#                                                          policy) -> MinIO, which checks the
-#                                                          policy's signature
-#   GET HEAD                 /attachments/*, /profiles/*   anonymous reads -> MinIO; the bucket
-#                                                          policy allows GetObject on exactly
-#                                                          these two prefixes
+#                                                          policy, from the chat server for a
+#                                                          profile photo, from the storage
+#                                                          service for a group photo) -> MinIO,
+#                                                          which checks the policy's signature
+#   GET HEAD                 /attachments/*, /profiles/*,  anonymous reads -> MinIO; the bucket
+#                            /groups/*                     policy allows GetObject on exactly
+#                                                          these three prefixes
 #
 # Nothing else gets through. No `encode`: every object is ciphertext, which does not compress, and
 # the desktop refuses an attachment download without Content-Length, which the encoder drops.
@@ -165,7 +167,10 @@
 
 	@read {
 		method GET HEAD
-		path /attachments/* /profiles/*
+		# /groups/<group id>/<random>: group photos (2026-09-29). The desktop asks for them with the
+		# slashes percent-encoded (/groups%2F<id>%2F<random>); this matcher compares the decoded
+		# path, and MinIO decodes the object name the same way.
+		path /attachments/* /profiles/* /groups/*
 	}
 	handle @read {
 		# {path}, not {uri}: no query string reaches MinIO, so no S3 sub-resources either.

@@ -84,9 +84,12 @@ fi
 
 # Reads from the CDN are anonymous, as on Signal's own CDNs: an object name is 120 or more random
 # bits and every object is end-to-end-encrypted ciphertext. Anonymous access is s3:GetObject on
-# exactly the two prefixes clients read, attachments/ (CDN3 uploads) and profiles/ (avatars):
-# no listing, nothing else. Caddy publishes only GET/HEAD on those two paths.
-# See docs/STAGING.md, section 8a.
+# exactly the three prefixes clients read: attachments/ (CDN3 uploads, 15 random bytes per key),
+# profiles/ (profile photos, 16 random bytes) and groups/ (group photos,
+# groups/<group id>/<16 random bytes>, encrypted with the group's key, from which the id is
+# derived; only the members hold that key). No listing, nothing else. Caddy publishes only
+# GET/HEAD on those three paths. set-json replaces the whole bucket policy, so running this
+# again is harmless. See docs/STAGING.md, sections 5c and 8a.
 cat > /tmp/swarm-cdn-anonymous.json <<'JSON'
 {
   "Version": "2012-10-17",
@@ -95,13 +98,14 @@ cat > /tmp/swarm-cdn-anonymous.json <<'JSON'
       "Effect": "Allow",
       "Principal": {"AWS": ["*"]},
       "Action": ["s3:GetObject"],
-      "Resource": ["arn:aws:s3:::swarm-cdn/attachments/*", "arn:aws:s3:::swarm-cdn/profiles/*"]
+      "Resource": ["arn:aws:s3:::swarm-cdn/attachments/*", "arn:aws:s3:::swarm-cdn/profiles/*",
+                   "arn:aws:s3:::swarm-cdn/groups/*"]
     }
   ]
 }
 JSON
 mc anonymous set-json /tmp/swarm-cdn-anonymous.json local/swarm-cdn
-echo "[minio-bootstrap] anonymous GetObject on swarm-cdn/attachments/* and swarm-cdn/profiles/*"
+echo "[minio-bootstrap] anonymous GetObject on swarm-cdn/attachments/*, swarm-cdn/profiles/* and swarm-cdn/groups/*"
 
 # The CDN3 upload service (tus/) writes finished attachments with its own key, which may put and
 # get objects under attachments/ and nothing else. Its credentials come from tus.env.

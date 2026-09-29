@@ -34,7 +34,8 @@
 #                               the CDN bucket, signed with the CDN key the chat server uses for
 #                               profile avatars (values from .env through docker-compose.yml).
 #                               Uploads reach MinIO through cdn.chat.swarm.green's POST route;
-#                               DOWNLOADS of groups/* are not published yet (section 5c).
+#                               members read them anonymously from the same host, GET
+#                               /groups/<group id>/<random>, like profile photos (section 5c).
 #   openTelemetry               off: nothing is exported anywhere.
 
 server:
