@@ -94,7 +94,7 @@ Four names, all `A` (and `AAAA` if the host has IPv6) to the staging host:
 | Name | Answered by | Status |
 |---|---|---|
 | `chat.swarm.green` | Caddy → chat:8080 (REST, websocket), chat:50051 (gRPC) | **required.** The API, the websocket and gRPC. This is the only endpoint clients talk to |
-| `cdn.chat.swarm.green` | Caddy → MinIO and the `tus` service | **required for attachments and avatars.** Anonymous GET/HEAD of `attachments/*` and `profiles/*`, TUS uploads under `/upload/attachments` (token from the chat server), avatar POST forms (signed by the chat server). Nothing else; see section 8a |
+| `cdn.chat.swarm.green` | Caddy → MinIO and the `tus` service | **required for attachments and avatars.** Anonymous GET/HEAD of `attachments/*`, `profiles/*` and `groups/*`, TUS uploads under `/upload/attachments` (token from the chat server), avatar POST forms (signed by the chat server for profile photos, by the storage service for group photos). Nothing else; see sections 8a and 5c |
 | `reg.chat.swarm.green` | Caddy, returns 404 | **reserved, deliberately not proxied.** The registration stub accepts one fixed code for every phone number; publishing it would let anyone register any number. The name exists so a misconfigured client fails loudly instead of silently reaching something else |
 | `sfu.chat.swarm.green` | nothing yet | **reserved.** Named in the TURN configuration because `CloudflareTurnConfiguration.urls` is `@NotEmpty` and cannot be left empty. No SFU or TURN server is deployed, so calling does not work |
 
@@ -425,6 +425,8 @@ with two desktop instances (swarm-main `e01c737c0`, fresh wallet accounts) again
 emulator restarted, the group and its history were still there and one more message went each way.
 Proposed on 2026-09-27 by Opus M-H; the three options he listed are at the end of this section.
 
+**Group photos: IMPLEMENTED and TESTED 2026-09-29 (Opus M6d)**; see "Group photos" below.
+
 ### What it is
 
 Signal keeps groups and the settings/contacts sync out of the chat server, in a second
@@ -452,6 +454,7 @@ that reason.
 | `bigtable-bootstrap` | same image, runs `bigtable/bootstrap-tables.sh` | one-shot | creates the tables and their column families with `cbt`; idempotent |
 | `storage` | image `swarm-messenger/storage-service:staging`, built by `storage/Dockerfile` from the fork's jar | `storage:8080` API, `storage:8081` Dropwizard admin, not published | the storage service |
 | Caddy | chat site block, `@storage` | `https://chat.swarm.green/v1/storage`, `/v1/storage/*`, `/v2/groups`, `/v2/groups/*`, **except** `GET /v1/storage/auth` | the public route (HTTP/1.1 to `storage:8080`) |
+| Caddy | `cdn.` site block, `@read` | `GET`/`HEAD` `https://cdn.chat.swarm.green/groups/*` | group photos, read anonymously from MinIO (see "Group photos") |
 | chat | `staging.yml` `storageService.uri: http://storage:8080` | | calls `DELETE /v1/storage` when an account is deleted; hands out the `/v1/storage` credentials on `GET /v1/storage/auth` |
 
 `GET /v1/storage/auth` stays with the chat server: it is the chat server's own endpoint
@@ -567,14 +570,76 @@ docker compose up -d storage                      # empty tables again
 Clients keep their local copies: every existing group becomes unusable (changes and endorsement
 refreshes fail) and has to be created again; settings sync uploads a fresh manifest by itself.
 
+### Group photos
+
+**Status 2026-09-29 (Opus M6d): IMPLEMENTED and TESTED on the chat host.** Deployed 01:09-01:10
+UTC (swarm-main `2d8aa9f6f`). Until then a group photo could be uploaded but nobody could
+read it: the edge published reads only for `/attachments/*` and `/profiles/*`, and the bucket's
+anonymous policy covered only those two prefixes.
+
+A group photo takes the same CDN0 path as a profile photo (section 8a), except that the storage
+service, not the chat server, signs the upload form:
+
+1. A member allowed to change the group's attributes asks for a form,
+   `GET https://chat.swarm.green/v2/groups/avatar/form` (group auth). The storage service answers
+   with an S3 POST policy for `groups/<group id>/<random>` in the bucket `swarm-cdn`: the group id
+   in base64url (43 characters), `<random>` the base64url of 16 random bytes (22 characters), 1 byte
+   to 3 MiB, signed with the CDN key (`cdn.*` in `storage.yml`).
+2. The client encrypts the photo with the group's key (a zkgroup `GroupAttributeBlob`, like the
+   group title) and `POST`s it as `multipart/form-data` to `https://cdn.chat.swarm.green/`, where
+   MinIO checks the policy and its signature (`204`). Then it records the object name in the group
+   with `PATCH /v2/groups`; the storage service accepts only `groups/<this group's id>/<16 bytes>`.
+3. The other members apply the change, download
+   `https://cdn.chat.swarm.green/groups/<group id>/<random>` without credentials and decrypt it with
+   the group's key. The desktop percent-encodes the slashes (`/groups%2F<id>%2F<random>`,
+   `encodeURIComponent` in `getGroupAvatar`); Caddy's `path` matcher compares the decoded path and
+   MinIO decodes the object name, so both spellings reach the same object.
+
+What is served anonymously: `s3:GetObject` on `swarm-cdn/groups/*`, the bucket policy that
+`minio/bootstrap-buckets.sh` sets, reachable only with `GET` or `HEAD` on `/groups/*` (the `@read`
+matcher of the `cdn.` block in `caddy/Caddyfile`). No listing, no other method, no query string.
+That is acceptable for the same reason as for attachments and profile photos: fetching an object
+needs its name, whose last part alone is 128 random bits (the middle part is the group's 256-bit
+identifier, which only its members and the storage service know), and what comes back is
+ciphertext that only a member can decrypt. The CDN key's own policy (`swarm-cdn-rw`) already lets
+it write anywhere in `swarm-cdn`, so uploads needed no change.
+
+Applying it to a running stack, as on 2026-09-29: `caddy/Caddyfile` replaced in place, validated
+and reloaded (commands in "First install, and updating the service" above), then
+
+```sh
+docker compose up --no-deps minio-bootstrap   # sets the new anonymous policy; the rest of the
+                                              # script finds everything in place and re-uploads the
+                                              # two swarm-config objects unchanged
+docker compose run --rm --no-deps -T --entrypoint /bin/sh minio-bootstrap -c \
+  'mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc anonymous get-json local/swarm-cdn'
+# ..."Resource":["arn:aws:s3:::swarm-cdn/attachments/*","arn:aws:s3:::swarm-cdn/groups/*","arn:aws:s3:::swarm-cdn/profiles/*"]...
+```
+
+Checks from anywhere:
+
+```sh
+curl -sI https://cdn.chat.swarm.green/groups/<group id>/<random>   # 200, Content-Length of the object
+curl -sI https://cdn.chat.swarm.green/groups/<made-up>/<made-up>   # 404 NoSuchKey, Server: MinIO
+```
+
+A made-up name answers 404 from MinIO because anonymous `GetObject` is allowed on the prefix. A 403
+with `Server: MinIO` means the bucket policy lacks `groups/*`; a 404 with `Server: Caddy` means the
+running Caddy configuration lacks `/groups/*`.
+
+Tested 2026-09-29, 01:13-01:17 UTC, with the two hidden desktop instances of the groups test
+above (swarm-main `e01c737c0`, the group they share): A set a 256x256 PNG as the group photo in
+*Edit group*; A's log shows `GET /v2/groups/avatar/form 200`,
+`POST https://cdn.chat.swarm.green/ 204` and `PATCH /v2/groups 200`. B applied the change (group
+version 0 to 1), downloaded the photo
+(`GET (REST) https://cdn.chat.swarm.green/[REDACTED]... 200 Success`; the edge logged
+`GET /groups%2F... 200`, 16,563 bytes) and showed it in the chat list, the conversation header and
+the group details, and still after a restart. From outside, that object answered 200 with
+`Content-Length: 16563` under both spellings, made-up names under `/groups/` 404 from MinIO, an
+existing `/profiles/` object still 200, and paths outside the three prefixes 404 from Caddy.
+
 ### Known gaps
 
-- **Group photos.** Uploads reach MinIO (`cdn.chat.swarm.green` forwards the avatar POST, the
-  CDN key may write anywhere in the bucket), but the edge publishes reads only for
-  `/attachments/*` and `/profiles/*`, and the bucket's anonymous read policy covers only those
-  two prefixes, so members do not see a group photo. PROPOSED: add `/groups/*` to the `@read`
-  matcher of the `cdn.` block in `caddy/Caddyfile` and `arn:aws:s3:::swarm-cdn/groups/*` to the
-  anonymous policy in `minio/bootstrap-buckets.sh`. Not done.
 - **One host name for two services.** The desktop treats a 401 from `chat.swarm.green` as "we
   might be unlinked" and reconnects its websocket, so a storage-service 401 (an expired
   credential) causes one harmless reconnect. Upstream Signal uses a separate storage host.
@@ -783,14 +848,16 @@ below was written from this revision's code and the desktop client's before the 
 
 Every byte that reaches the CDN is **ciphertext**. The client encrypts an attachment with a
 random per-attachment key (AES-256-CBC + HMAC-SHA256) that travels only inside the end-to-end
-encrypted message, and an avatar with the profile key. Neither the chat server, the upload
-service nor MinIO ever sees a key. Object names are random, and anyone who knows one can fetch
-the ciphertext, exactly as on Signal's own CDNs.
+encrypted message, a profile photo with the profile key, and a group photo with the group's key.
+Neither the chat server, the storage service, the upload service nor MinIO ever sees a key.
+Object names are random, and anyone who knows one can fetch the ciphertext, exactly as on
+Signal's own CDNs.
 
 | What | Upload | Stored in MinIO bucket `swarm-cdn` as | Read with |
 |---|---|---|---|
 | message attachments (images, files, voice notes, link-preview images) | **CDN3**: TUS to `https://cdn.chat.swarm.green/upload/attachments`, served by the `tus` service | `attachments/<key>` | `GET https://cdn.chat.swarm.green/attachments/<key>` |
 | profile avatars | **CDN0**: S3 POST-policy form to `https://cdn.chat.swarm.green/`, checked by MinIO | `profiles/<name>` | `GET https://cdn.chat.swarm.green/profiles/<name>` |
+| group photos (since 2026-09-29) | **CDN0**: the same, with the form from the storage service (`GET /v2/groups/avatar/form`, section 5c) | `groups/<group id>/<random>` | `GET https://cdn.chat.swarm.green/groups/<group id>/<random>` |
 
 CDN2 (Google Cloud Storage resumable uploads) cannot work here and is never handed out once the
 `cdn3` experiment below is on. Upload forms that still said CDN2 are what made the first
@@ -931,7 +998,7 @@ ciphertext does not compress anyway).
 |---|---|---|---|
 | POST, PATCH, HEAD, OPTIONS | `/upload/attachments`, `/upload/attachments/*` | `tus:1080` | the service verifies the JWT on every POST, HEAD and PATCH |
 | POST, `Content-Type: multipart/form-data` | `/` | MinIO, bucket `swarm-cdn` | MinIO verifies the POST policy and its SigV4 signature |
-| GET, HEAD | `/attachments/*`, `/profiles/*` | MinIO, bucket `swarm-cdn` | bucket policy: anonymous `s3:GetObject` on exactly these two prefixes; no listing, nothing else |
+| GET, HEAD | `/attachments/*`, `/profiles/*`, `/groups/*` | MinIO, bucket `swarm-cdn` | bucket policy: anonymous `s3:GetObject` on exactly these three prefixes; no listing, nothing else |
 | anything else | | 404 | |
 
 Nothing published accepts an unauthenticated write: a TUS write needs the chat server's token, a
@@ -1069,7 +1136,7 @@ lose it and re-register the test accounts.
 | `storage` exits at start: `DecoderException`, `InvalidInputException` or an unresolved `${SWARM_STORAGE_...}` | `storage.env` is missing | `./storage/make-storage-env.sh`, then `docker compose up -d storage` |
 | `storage` unhealthy, its log shows `NOT_FOUND` for a `swarm_storage_*` table | the tables were never created in this emulator volume | `docker compose up bigtable-bootstrap` and read its output, then `docker compose restart storage` |
 | Desktop: a new account's first `GET /v1/storage/manifest` answers 404, log `sync(0): missing` | nothing stored for it yet | expected; the app writes the first manifest right after (`PUT /v1/storage/ 200`) |
-| A group photo does not show for the other members | reads of `groups/*` are not published on `cdn.chat.swarm.green` | known gap, section 5c |
+| A group photo does not show for the other members; their log has `GET (REST) https://cdn.chat.swarm.green/[REDACTED]...` with 403 or 404 | 403 with `Server: MinIO`: the bucket's anonymous policy lacks `groups/*` (an older `minio/bootstrap-buckets.sh` ran); 404 with `Server: Caddy`: the running Caddy config lacks `/groups/*` in the `cdn.` block's `@read` | `docker compose up --no-deps minio-bootstrap`, check `mc anonymous get-json local/swarm-cdn`; or validate and `caddy reload`. Section 5c, "Group photos" |
 | An attachment spins forever; the client log shows a POST to `gcs.disabled.swarm.invalid` | the account got a CDN2 form: the `cdn3` experiment is missing from `s3://swarm-config/dynamic-config.yaml` | `docker compose up minio-bootstrap` (re-uploads `minio/dynamic-config.yaml`); the server re-reads it within 30 s |
 | `tus` answers 401 to every upload | `SWARM_TUS_TOKEN_SECRET` in `tus.env` is not `tus.userAuthenticationTokenSharedSecret` | fix `tus.env`, `docker compose up -d --no-deps tus` |
 | `tus` is unhealthy, `/healthz` says `S3 HEAD answered 403` | its MinIO user or policy is missing | `docker compose up minio-bootstrap`, then wait a minute (it re-probes) |
