@@ -11,12 +11,25 @@
 #
 # HOW THE VALUES WERE CHOSEN
 # -----------------------------------------------------------------------------------------------
-#   bigtable.*                  the Bigtable emulator on the compose network (`bigtable`; the
-#                               service finds it through BIGTABLE_EMULATOR_HOST, set in
-#                               docker-compose.yml). projectId/instanceId are labels the emulator
-#                               does not check; the four table ids are this deployment's
-#                               (swarm_ prefix, like the DynamoDB tables) and must match
-#                               bigtable/bootstrap-tables.sh, which creates them.
+#   storage.backend             foundationdb: groups, group logs and the settings/contacts sync
+#                               records live in the stack's FoundationDB cluster (the chat
+#                               server's), not in the Bigtable emulator (docs/SWARM-CHANGES.md,
+#                               section 3, in the fork). `bigtable` would switch back.
+#   storage.foundationdb.*      clusterFile: the cluster file the `foundationdb` service writes to
+#                               the fdb-etc volume, mounted read-only at /etc/foundationdb as for
+#                               the chat server. directory: the service's own Directory-layer
+#                               directory; it creates four subdirectories below it (groups,
+#                               group-logs, storage-manifests, storage-items) and touches nothing
+#                               else in the cluster. transactionTimeout/RetryLimit: the fork's
+#                               defaults (10 s including retries, 100 retries).
+#   bigtable.*                  the Bigtable emulator on the compose network (`bigtable`; found
+#                               through BIGTABLE_EMULATOR_HOST, set in docker-compose.yml). Since
+#                               the switch to FoundationDB the service no longer reads it; only
+#                               the one-off migrate-bigtable-to-foundationdb command does (its
+#                               source; docs/STAGING.md, section 5c). Remove this block together
+#                               with the emulator once the migration is verified. projectId/
+#                               instanceId are labels the emulator does not check; the four table
+#                               ids must match bigtable/bootstrap-tables.sh, which creates them.
 #   authentication.key          hex of the chat server's storageService.userAuthenticationTokenSharedSecret:
 #                               the same 32 bytes, so the Basic credentials the chat server hands
 #                               out on GET /v1/storage/auth verify here.
@@ -45,6 +58,12 @@ server:
   adminConnectors:
     - type: http
       port: 8081
+
+storage:
+  backend: foundationdb
+  foundationdb:
+    clusterFile: /etc/foundationdb/fdb.cluster
+    directory: [swarm-storage-service]
 
 bigtable:
   projectId: swarm-staging

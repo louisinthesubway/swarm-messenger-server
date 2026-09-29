@@ -285,12 +285,13 @@ services:
       - swarm
 
   # ---------------------------------------------------------------- Bigtable emulator
-  # The storage service (below) keeps groups, group change logs, and the settings/contacts sync
-  # records in Bigtable, the only backend it has. No Google Cloud here: an emulator on the
-  # compose network, fullstorydev/emulators' cbtemulator (a fork of Google's bttest emulator)
-  # built from pinned source in bigtable/Dockerfile, with its tables in LevelDB on the
-  # `bigtable-data` volume, so groups survive a restart of this container. Google's own
-  # emulator would keep them in memory only. Not published on the host. docs/STAGING.md, 5c.
+  # The storage service (below) kept groups, group change logs, and the settings/contacts sync
+  # records here until its switch to FoundationDB (storage.yml, storage.backend):
+  # fullstorydev/emulators' cbtemulator (a fork of Google's bttest emulator) built from pinned
+  # source in bigtable/Dockerfile, with its tables in LevelDB on the `bigtable-data` volume. The
+  # emulator and its one-shot now stay only as the source of the one-off
+  # migrate-bigtable-to-foundationdb command; remove both, and the bigtable block of storage.yml,
+  # once the migration is verified (docs/STAGING.md, 5c). Not published on the host.
   bigtable:
     <<: *restart
     build:
@@ -466,6 +467,8 @@ services:
   # Plain HTTP on the compose network, not published on the host. The image is built from a
   # checkout of the fork: see storage/Dockerfile. The three secrets come from storage.env
   # (storage/make-storage-env.sh); the CDN key for group avatars from .env. docs/STAGING.md, 5c.
+  # Its data lives in the `foundationdb` service (the chat server's cluster, in the storage
+  # service's own directory): the cluster file comes read-only from fdb-etc, as for chat.
   storage:
     <<: *restart
     build:
@@ -473,6 +476,11 @@ services:
     image: swarm-messenger/storage-service:staging
     hostname: storage
     depends_on:
+      foundationdb:
+        condition: service_healthy
+      foundationdb-init:
+        condition: service_completed_successfully
+      # Only for the migration command's source; goes with the emulator (see `bigtable` above).
       bigtable-bootstrap:
         condition: service_completed_successfully
     # Optional so that other compose commands (the nightly backup's `stop chat`) never fail on a
@@ -481,6 +489,7 @@ services:
       - path: storage.env
         required: false
     environment:
+      # Read only by migrate-bigtable-to-foundationdb (the service itself uses FoundationDB).
       BIGTABLE_EMULATOR_HOST: bigtable:8086
       SWARM_CDN_ACCESS_KEY: ${SWARM_CDN_ACCESS_KEY:-swarmcdn}
       SWARM_CDN_SECRET_KEY: ${SWARM_CDN_SECRET_KEY:-}
@@ -492,11 +501,13 @@ services:
         -XX:HeapDumpPath=/tmp/heapdump.bin
     volumes:
       - ./storage.yml:/config/storage.yml:ro
+      - fdb-etc:/etc/foundationdb:ro
     networks:
       - swarm
     healthcheck:
-      # /_ready reads one row from each of the four tables on its first calls (upstream's
-      # warm-up), so "healthy" means the service is up AND reaches its tables.
+      # /_ready reads one key-value from each of the service's four FoundationDB subdirectories on
+      # its first calls (upstream's warm-up, one row per table), so "healthy" means the service is
+      # up AND reaches its data.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /_ready HTTP/1.0\\r\\n\\r\\n' >&3 && head -c 12 <&3 | grep -q '200'"]
       interval: 15s
       timeout: 10s
