@@ -1,9 +1,11 @@
 # SWARM Messenger staging server — runbook
 
 A self-hosted Signal-Server derivative on one Linux host. Registration, accounts, prekeys,
-profiles and messaging work, and since 2026-09-28 groups and settings sync (Signal's separate
-storage service, section 5c). Every cloud dependency is replaced by a container on the same
-host, and every feature that needs an SGX enclave or a commercial account is switched off.
+profiles and messaging work, since 2026-09-28 groups and settings sync (Signal's separate
+storage service, section 5c), and since 2026-09-29 voice and video calls, one-to-one and in groups,
+and call links (a TURN relay and Signal's calling service, section 5d). Every cloud dependency is
+replaced by a container on the same host, and every feature that needs an SGX enclave or a
+commercial account is switched off.
 
 Everything described here lives in [`deploy/staging/`](../deploy/staging). Deviations from
 upstream code are in [`SWARM-CHANGES.md`](SWARM-CHANGES.md). What was and was not verified on
@@ -51,7 +53,10 @@ Published on the host:
 
 | Port | Bind | Service | Purpose |
 |---|---|---|---|
-| 443 (tcp+udp) | `0.0.0.0` | Caddy | public HTTPS / HTTP-3 for `chat.` and `cdn.` |
+| 443 (tcp+udp) | `0.0.0.0` | Caddy | public HTTPS / HTTP-3 for `chat.`, `cdn.` and `sfu.` |
+| 3478 (udp+tcp) | `64.95.11.180` | coturn (host network) | TURN for one-to-one calls (section 5d) |
+| 49160-49259/udp | `64.95.11.180` | coturn | TURN relay ports, one per allocation |
+| 10000 (udp+tcp) | `0.0.0.0` | calling-backend | group-call media (ICE/SRTP), UDP first, TCP for networks that block UDP |
 | 80 | `0.0.0.0` | Caddy | ACME challenge and HTTP→HTTPS redirect |
 | 8080 | `127.0.0.1` | chat | h2c REST + websocket. Loopback only; Caddy reaches it over the Docker network |
 | 8081 | `127.0.0.1` | chat | Dropwizard admin: `/healthcheck`, `/metrics`. **Never publish this** |
@@ -70,6 +75,9 @@ Internal to the Docker network `swarm-staging` (10.77.0.0/24), never published:
 | `registration-stub:8443` | the fixed-code registration stub, gRPC over TLS with a private CA |
 | `storage:8080`, `storage:8081` | the storage service (groups, settings sync) and its Dropwizard admin. Caddy publishes only `/v1/storage*` and `/v2/groups*` on it (section 5c) |
 | `bigtable:8086` | the Bigtable emulator the storage service keeps its tables in (gRPC) |
+| `turn-credentials:8080` | TURN credentials in Cloudflare's API shape, for the chat server only (section 5d) |
+| `calling-frontend:8080`, `:8100` | the calling service's client API (Caddy publishes `/v2/conference/participants` and `/v1/call-link` on `sfu.`) and its internal API for the backend |
+| `10.77.0.31:8080` | `calling-backend`'s signaling API, for the frontend (fixed address: the frontend stores it in each call record) |
 
 The Redis clusters have static IPs on purpose: a Redis cluster advertises the address it
 believes it has, and Lettuce connects to whatever `CLUSTER SLOTS` returns. With dynamic
@@ -83,7 +91,12 @@ ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443
 ufw enable
+./ufw-calls.sh     # calls (section 5d): 3478/udp+tcp, 49160:49259/udp, 10000/udp+tcp
 ```
+
+coturn runs in the host's network namespace, so UFW decides whether it is reachable. Ports that
+Docker publishes (443, 80, 10000) are forwarded by Docker's own iptables chains before UFW's rules are
+consulted; their UFW rules document the opening rather than create it.
 
 ---
 
@@ -96,7 +109,7 @@ Four names, all `A` (and `AAAA` if the host has IPv6) to the staging host:
 | `chat.swarm.green` | Caddy → chat:8080 (REST, websocket), chat:50051 (gRPC) | **required.** The API, the websocket and gRPC. This is the only endpoint clients talk to |
 | `cdn.chat.swarm.green` | Caddy → MinIO and the `tus` service | **required for attachments and avatars.** Anonymous GET/HEAD of `attachments/*`, `profiles/*` and `groups/*`, TUS uploads under `/upload/attachments` (token from the chat server), avatar POST forms (signed by the chat server for profile photos, by the storage service for group photos). Nothing else; see sections 8a and 5c |
 | `reg.chat.swarm.green` | Caddy, returns 404 | **reserved, deliberately not proxied.** The registration stub accepts one fixed code for every phone number; publishing it would let anyone register any number. The name exists so a misconfigured client fails loudly instead of silently reaching something else |
-| `sfu.chat.swarm.green` | nothing yet | **reserved.** Named in the TURN configuration because `CloudflareTurnConfiguration.urls` is `@NotEmpty` and cannot be left empty. No SFU or TURN server is deployed, so calling does not work |
+| `sfu.chat.swarm.green` | Caddy → calling-frontend:8080 (HTTPS); coturn on 3478 (TURN); calling-backend on 10000 (media) | **required for calls** (since 2026-09-29, section 5d). The clients' `sfuUrl` for group calls and call links, and the host name in the TURN URLs the chat server hands out for one-to-one calls |
 
 Point DNS at the host **before** starting the `edge` profile: Caddy's ACME client fails
 (and backs off) if the names do not resolve to it yet.
@@ -237,7 +250,7 @@ per-deployment, not per-repository.
 | `serverTrustRoots` | sealed-sender trust roots, base64 public keys. A **list**, so a future rotation can publish the new root beside the old one and clients accept both during the overlap | public half of `unidentifiedDelivery.privateKey`; the server's `unidentifiedDelivery.certificate` is signed by it |
 | `registrationCaCertificatePem` | the stack's **internal** CA, used only for the chat server's gRPC hop to the registration stub. **Clients do not need it**; public HTTPS uses Let's Encrypt | `certs/swarm-staging-ca.crt`, also in `.env` as `SWARM_REGISTRATION_CA_PEM` |
 | `endpoints.registration` | `null` on purpose: `reg.chat.swarm.green` is not published | — |
-| `endpoints.sfu` | `null` on purpose: no SFU or TURN server exists | — |
+| `endpoints.sfu` | `https://sfu.chat.swarm.green` since 2026-09-29 (files generated before say `null`; the clients never read it: they carry the SFU URL in their own `sfuUrl` setting) | the calling service, section 5d |
 
 **Correction, 2026-09-27 (Opus M-H).** Until then this table and `generate-secrets.sh` gave
 `genericServerPublicParams` the chat set. Signal's own clients use the chat set only for backups
@@ -643,7 +656,8 @@ existing `/profiles/` object still 200, and paths outside the three prefixes 404
 - **One host name for two services.** The desktop treats a 401 from `chat.swarm.green` as "we
   might be unlinked" and reconnects its websocket, so a storage-service 401 (an expired
   credential) causes one harmless reconnect. Upstream Signal uses a separate storage host.
-- **Group calls.** `GET /v2/groups/token` works, but there is no calling server (section 8).
+- **Group calls** work since 2026-09-29: the calling frontend checks the token from
+  `GET /v2/groups/token` with this service's `group.externalServiceSecret` (section 5d).
 - `/v1/groups` (groups v1) is not routed; no current client uses it.
 
 ### What the desktop calls on `storageUrl`
@@ -678,6 +692,270 @@ is not the service answered).
 
 ---
 
+## 5d. Calls: the TURN relay (one-to-one) and the calling service (group calls, call links)
+
+**Status 2026-09-29 (Opus M7): IMPLEMENTED and TESTED on the chat host.** Deployed 02:06-02:16 UTC.
+Tested 02:21-02:30 UTC with the two hidden desktop instances of the groups test (swarm-main
+`e01c737c0`, Chromium's synthetic camera, microphones muted): a one-to-one voice call forced through
+the relay, a group call, and a call link with admin approval. What exactly was seen is at the end
+of this section. Nothing in the chat server, the storage service or the clients changed: this is
+deployment and configuration, plus one small change in the calling service's fork (below).
+
+### What the clients do
+
+**One-to-one calls.** The call itself is set up with ordinary end-to-end encrypted messages through
+the chat server (that always worked). For the media, each client asks the chat server for relays,
+`GET /v2/calling/relays` (authenticated), and gets:
+
+```json
+{"relays": [{"username": "<expiry>:<random>", "password": "<HMAC>", "ttl": 43200,
+  "urls": ["turn:sfu.chat.swarm.green:3478"],
+  "urlsWithIps": ["turn:64.95.11.180", "turn:64.95.11.180:3478?transport=tcp"],
+  "hostname": "sfu.chat.swarm.green"}]}
+```
+
+`turn:<ip>` without a port is UDP on 3478 (the default port of `turn:` URLs), the second is TCP on
+3478; both are coturn. The two clients connect directly when their networks let them and through
+the relay otherwise. The desktop uses the relay **only** (it hides its IP address) for calls with
+someone who is not a contact yet and, for every call, with *Settings > Privacy > Advanced > Always
+relay calls*.
+
+This Signal-Server version can get TURN credentials from exactly one kind of service, Cloudflare's
+TURN API: `CloudflareTurnCredentialsManager` POSTs `{"ttl": <seconds>}` with
+`Authorization: Bearer <turn.cloudflare.apiToken>` to `turn.cloudflare.endpoint`, **requires HTTP
+201**, reads `{"iceServers": {"username", "credential"}}` and hands clients its own configured URLs.
+The endpoint is configurable, so `turn-credentials` answers in exactly that shape with coturn's
+TURN REST credentials: username `<expiry, unix seconds>:<16 random characters>`, credential
+`base64(HMAC-SHA1(static-auth-secret, username))`, which coturn recomputes and refuses after the
+expiry. No server code changed and nothing is sent to Cloudflare.
+
+**Group calls.** The clients have the calling service in their own configuration
+(`sfuUrl: https://sfu.chat.swarm.green/`). A member asks the storage service for a group-call token,
+`GET /v2/groups/token` (section 5c): `2:<sha256 of the member's encrypted id>:<group id>:<time>:<0|1>:<first
+10 bytes of an HMAC-SHA256>`, keyed with the storage service's `group.externalServiceSecret`. With it
+the client looks at (`GET`) and joins (`PUT`) `/v2/conference/participants` on the calling
+**frontend**, which checks the HMAC with the same key, keeps a call record in DynamoDB and puts the
+call on the calling **backend**. The media then goes straight between the client and the backend,
+`64.95.11.180:10000` (UDP, or TCP), not through Caddy. Group media is end-to-end encrypted by the
+clients (frame encryption); the backend forwards what it cannot read.
+
+**Call links.** A client gets a create-call-link credential from the chat server
+(`POST /v1/call-link/create-auth`, issued with `callingZkConfig`) and presents it to the frontend
+(`PUT /v1/call-link`); later readers present call-link auth credentials that the chat server hands
+out with the group credentials. The frontend verifies both with the calling zkgroup **secret**
+(`GenericServerSecretParams`), which is why it holds a copy of `callingZkConfigV101.serverSecret`.
+
+### The pieces
+
+| Piece | Image / source | Where | What it does |
+|---|---|---|---|
+| `coturn` | `coturn/coturn:4.18.0-trixie` by digest | host network; `64.95.11.180:3478` UDP+TCP, relays on `49160-49259/udp` | the TURN relay. `coturn/turnserver.conf` |
+| `turn-credentials` | `swarm-messenger/turn-credentials:staging`, `turn-credentials/Dockerfile` (the pinned `node:22-alpine` of `tus`, standard library only) | `turn-credentials:8080`, compose network only | `POST /credentials/generate`: 201 with credentials for the right Bearer token, 401 otherwise, 405 for other methods, ttl capped at 48 h. `turn-credentials/server.mjs`, tests in `turn-credentials/test/` |
+| `calling-bootstrap` | `amazon/aws-cli:2.31.11` (as `dynamodb-bootstrap`) | one-shot | creates the frontend's table `swarm_calling_rooms` in the stack's DynamoDB Local (upstream's schema, index `region-index`, TTL on `deleteAt`). `sfu/bootstrap-calling-table.sh` |
+| `calling-backend` | `swarm-messenger/calling-backend:staging`, `sfu/Dockerfile` target `backend` | `10000/udp`+`tcp` published; signaling `10.77.0.31:8080` | forwards group-call media (SFU) |
+| `calling-frontend` | `swarm-messenger/calling-frontend:staging`, target `frontend` | `calling-frontend:8080` (client API), `:8100` (internal API for the backend) | authenticates clients, call records and call links, assigns calls to the backend |
+| Caddy | `sfu.chat.swarm.green` site block | `https://sfu.chat.swarm.green` | publishes `/v2/conference/participants` and `/v1/call-link` only; everything else 404. Passes and logs no client address, logs no header |
+| chat | `staging.yml` `turn.cloudflare.endpoint: http://turn-credentials:8080/credentials/generate` | | asks `turn-credentials` for credentials on `GET /v2/calling/relays` |
+
+**Source of the calling service.** [`louisinthesubway/swarm-calling-service`](https://github.com/louisinthesubway/swarm-calling-service),
+a GitHub fork of [`signalapp/Signal-Calling-Service`](https://github.com/signalapp/Signal-Calling-Service)
+(AGPL-3.0-only), branch `swarm-main` at `61e5d4085c04` = upstream `56da39e` (v141) plus one change
+recorded in its `docs/SWARM-CHANGES.md`: the frontend may read its two secrets from the environment
+(`CALLING_AUTH_KEY`, `CALLING_ZKPARAMS`) instead of its command line, where every local user of the
+host can read them in `/proc/<pid>/cmdline` and any `ps` listing shows them. No cryptography,
+protocol or API code differs. `sfu/Dockerfile` fetches exactly that commit (and checks it), builds
+both programs with `cargo build --release --locked` in the official `rust:1.97.1-trixie` image (the
+version of the source's `rust-toolchain` file) and puts each into `debian:trixie-slim`, both by
+digest. Build on this host: about 6.5 minutes (cargo 5 min 46 s with 4 of the 6 CPUs); the second
+target reuses the first one's build stage. Each image records its source commit in
+`/usr/local/share/calling-service/SOURCE_COMMIT`.
+
+### Configuration and secrets
+
+| Key | Where | Value | Why |
+|---|---|---|---|
+| `turn.cloudflare.apiToken` | `staging-secrets.yml` | 32 random bytes, hex (was the placeholder `unset` until 2026-09-29) | the chat server's Bearer token toward `turn-credentials` |
+| `SWARM_TURN_API_TOKEN` | `turn.env` | = `turn.cloudflare.apiToken` | the only token `turn-credentials` accepts |
+| `SWARM_TURN_STATIC_AUTH_SECRET` | `turn.env` | 32 random bytes, hex | coturn's `static-auth-secret` and the HMAC key of `turn-credentials`. coturn gets it through its environment: the container writes a copy of `turnserver.conf` plus this line into its tmpfs (mode 700, owned by the image's user) and starts from that copy, so it is never on a command line |
+| `CALLING_AUTH_KEY` | `sfu.env` | = `SWARM_STORAGE_GROUP_CALL_SECRET_HEX` in `storage.env` (hex, 32 bytes) | checks group-call tokens (the frontend's `--authentication-key`, hex) |
+| `CALLING_ZKPARAMS` | `sfu.env` | = `callingZkConfigV101.serverSecret` in `staging-secrets.yml` (base64 `GenericServerSecretParams`) | verifies call-link credentials (`--zkparams`). The frontend refuses to start without it. Not the public params: verifying a presentation needs the secret half |
+| `turn.cloudflare.requestedCredentialTtl` / `clientCredentialTtl` | `staging.yml` | `PT24H` / `PT12H` | credentials are minted for 24 h; clients cache the answer for 12 h |
+| `turn.cloudflare.urls`, `urlsWithIps`, `hostname` | `staging.yml` | unchanged since 2026-09-26 | see the answer above; `hostname` is resolved by the chat server for every request |
+
+`turn.env` is written by `coturn/make-turn-env.sh` and `sfu.env` by `sfu/make-sfu-env.sh`, once, mode
+600, git-ignored; neither prints a secret. `make-turn-env.sh` also replaces the placeholder
+`turn.cloudflare.apiToken: unset` in `staging-secrets.yml` **in place** (same inode and mode: that
+single file is bind-mounted into `chat`), and `generate-secrets.sh` writes a real token on a new host.
+
+coturn (`coturn/turnserver.conf`): listens only on `64.95.11.180` (`listening-ip`, `relay-ip`,
+`external-ip`; another host: change those three), port 3478 UDP and TCP, **no TLS listener**
+(`turns:`/5349) for now, RFC 5780 off, relay ports `49160-49259` (100 = `total-quota`; a desktop in a
+call holds one allocation per TURN URL and network interface, about 3 to 9, so this carries 5 to 15
+relayed one-to-one calls at once), `user-quota=16`, `max-bps=375000` (3 Mbit/s per allocation and
+direction), `bps-capacity=12500000` (100 Mbit/s for all relays), `use-auth-secret`,
+`realm=sfu.chat.swarm.green`, `fingerprint`, `no-tcp-relay`, `no-multicast-peers`,
+`no-software-attribute`, logs to stdout (errors only at this verbosity: no per-call lines).
+
+calling-backend: `--binding-ip=0.0.0.0 --ice-candidate-ip=64.95.11.180 --ice-candidate-port=10000
+--ice-candidate-port-tcp=10000 --signaling-ip=10.77.0.31 --signaling-port=8080
+--max-clients-per-call=16 --diagnostics-interval-secs=30` and the frontend's internal API for
+call-link approvals and removing ended calls. calling-frontend: `--region=swarm-staging
+--version=141 --max-clients-per-call=16 --cleanup-interval-ms=30000
+--regional-url-template=https://sfu.chat.swarm.green --calling-server-url=http://calling-backend:8080
+--storage-table=swarm_calling_rooms --storage-endpoint=http://dynamodb:8000 --internal-api-port=8100`.
+`--storage-endpoint` is upstream's switch for a local DynamoDB (fixed dummy keys); DynamoDB Local runs
+with `-sharedDb`, so the table is the same one `calling-bootstrap` created. No send-endorsement
+secret (`--endorsement-secret`) is configured.
+
+### Security
+
+- **The relay cannot reach inside.** `denied-peer-ip` refuses `0.0.0.0/8`, `10.0.0.0/8` (the
+  compose network `10.77.0.0/24` with every service of this stack), `100.64.0.0/10`, `127.0.0.0/8`
+  (the chat server's loopback ports, the resolver, other loopback services), `169.254.0.0/16`
+  (link-local, cloud metadata), `172.16.0.0/12` (`docker0` and swarm-pay's network),
+  `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`,
+  `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4` and `240.0.0.0/4`, written as ranges.
+  `no-tcp-relay`: a client can never open a TCP connection from this host. Tested: relaying to
+  `10.77.0.1`, `127.0.0.1`, `172.17.0.1` and `169.254.169.254` is refused with 403.
+- **IPv4 only, on purpose.** The relay address is IPv4 and a TURN server relays only to peers of
+  that family. IPv6 ranges are left out because coturn 4.18 skips the lower bound of a range that
+  starts at `::` and sorts every IPv4 address below every IPv6 one: `denied-peer-ip=::-::1` refused
+  **every** IPv4 peer, the public test peer included (seen on 2026-09-29, fixed before any client
+  used the relay). If the host gets IPv6, add IPv6 ranges together with an IPv6 `relay-ip`, none
+  starting at `::`, and test that a public IPv4 peer is still allowed.
+- **The host's own public address stays an allowed peer**, because two clients that both use the
+  relay reach each other through it (relay to relay). Consequence: a UDP service listening on
+  `64.95.11.180` is reachable through the relay even where UFW would block it from outside. Today
+  that is Caddy's 443/udp, coturn, the relay ports and the backend's 10000/udp, all public anyway;
+  keep it that way.
+- Credentials reach a client only through the authenticated, rate-limited `GET /v2/calling/relays`;
+  `turn-credentials` answers only the chat server's token and is not published.
+- No secret is on a command line or in a log: coturn and the frontend read theirs from the
+  environment, `turn-credentials` logs status, ttl and expiry only, the `sfu.` access log drops the
+  client address and all headers (the `Authorization` header carries the group-call token).
+- Scanners probed `sfu.chat.swarm.green/.env*` within seconds of the certificate appearing in the
+  certificate transparency logs; they get Caddy's 404.
+
+### First install, and applying it to a running stack (as on 2026-09-29)
+
+```sh
+cd /opt/swarm/swarm-messenger-server/deploy/staging
+./coturn/make-turn-env.sh                         # turn.env; replaces an `unset` apiToken in place
+./sfu/make-sfu-env.sh                             # sfu.env (needs storage.env, section 5c)
+docker compose build turn-credentials calling-backend calling-frontend
+docker compose up -d --no-deps turn-credentials coturn
+./ufw-calls.sh                                    # then: ufw status numbered
+# staging.yml: turn.cloudflare.endpoint -> http://turn-credentials:8080/credentials/generate
+docker compose restart chat                       # reads the endpoint and the new apiToken
+docker compose up --no-deps calling-bootstrap     # "+ swarm_calling_rooms", "+ ... TTL on deleteAt"
+docker compose up -d --no-deps calling-backend    # wait for (healthy), then
+docker compose up -d --no-deps calling-frontend
+# caddy/Caddyfile: the sfu.chat.swarm.green block; validate and reload (section 5c), then Caddy
+# gets the certificate by itself (tls-alpn-01).
+```
+
+Updating the calling service: set `CALLING_COMMIT` in `sfu/Dockerfile` to the new `swarm-main`
+commit of the fork, `docker compose build calling-backend calling-frontend`, then
+`docker compose up -d --no-deps calling-backend calling-frontend` (group calls in progress drop).
+
+### Checking it
+
+```sh
+docker compose ps coturn turn-credentials calling-backend calling-frontend   # all (healthy)
+ss -tulnp | grep turnserver                 # 64.95.11.180:3478 only (no 3479, 5349, 5766)
+curl -sI https://sfu.chat.swarm.green/v2/conference/participants     # 401 (frontend, no token)
+curl -s -o /dev/null -w '%{http_code}\n' https://chat.swarm.green/v2/calling/relays   # 401
+docker compose logs --since 10m turn-credentials   # "POST /credentials/generate 201 ttl=86400 expires=..."
+docker compose logs --since 10m calling-backend    # "call_id: ... adding demux_id: ...", diagnostics every 30 s
+```
+
+A relay test with a real credential, from the host (the minted credential never printed):
+
+```sh
+umask 077
+docker compose exec -T turn-credentials node -e 'fetch("http://127.0.0.1:8080/credentials/generate",
+  {method:"POST",headers:{Authorization:"Bearer "+process.env.SWARM_TURN_API_TOKEN},body:"{\"ttl\":300}"})
+  .then(r=>r.json()).then(j=>process.stdout.write(JSON.stringify(j.iceServers)))' > /root/cred.json
+TU=$(python3 -c 'import json; print(json.load(open("/root/cred.json"))["username"])')
+TP=$(python3 -c 'import json; print(json.load(open("/root/cred.json"))["credential"])')
+IMG=$(docker compose config --images | grep coturn)
+docker run -d --rm --name turn-peer --network host --entrypoint turnutils_peer "$IMG" -L 64.95.11.180 -p 3480
+docker run --rm --network host --entrypoint turnutils_uclient "$IMG" -u "$TU" -w "$TP" \
+  -e 64.95.11.180 -r 3480 -n 20 -m 1 -l 120 64.95.11.180 | grep -E 'tot_recv_msgs|lost packets'
+# add -t for TCP to the server; expect "tot_send_msgs=40, tot_recv_msgs=40" and "Total lost packets 0"
+docker rm -f turn-peer; rm /root/cred.json; unset TU TP
+```
+
+With `-e 10.77.0.1` (or any denied address) the same command must end in `channel bind: error 403`.
+From outside, a STUN Binding request to `64.95.11.180:3478` over UDP or TCP answers with a Success
+Response and an unauthenticated Allocate with 401, realm `sfu.chat.swarm.green`.
+
+In a desktop log a working one-to-one call shows `GET (WS) https://chat.swarm.green/v2/calling/relays
+200 Success`, RingRTC's `proceed(): ... hideIp: ...` followed by the three `server: turn:...` lines,
+local candidates `typ relay` on ports 49160-49259, and `ice_network_route_change(NetworkRoute {
+... local_relayed: true ... })` when it went through the relay; a group call shows
+`GET (REST) https://chat.swarm.green/v2/groups/token 200`, `PUT (REST)
+https://sfu.chat.swarm.green/v2/conference/participants 200 Success` and
+`LocalDeviceState (Connected, Joined)`. A **404** on `GET /v2/conference/participants` is normal: no
+call in that group yet.
+
+### Restart, reset, rotation
+
+- `coturn` or `turn-credentials`: `docker compose restart <service>`. Restarting coturn drops the
+  relayed media of calls in progress; clients keep their cached credentials (coturn checks them
+  against the unchanged secret).
+- `calling-backend`: restarting it ends every group call in progress; clients rejoin. The frontend
+  keeps the records and removes ended calls by itself (the backend calls its internal API; the
+  cleaner checks every 30 s).
+- Rotating the TURN secrets: delete `turn.env` (and set `turn.cloudflare.apiToken` back to `unset` for a
+  new API token), `./coturn/make-turn-env.sh`, `docker compose up -d --no-deps coturn turn-credentials`,
+  `docker compose restart chat`. Credentials clients already hold stop working at once, and a desktop
+  keeps its relay answer in memory for up to 12 hours (`clientCredentialTtl`): until then, or until
+  the app restarts, its calls cannot use the relay.
+- Rotating `sfu.env` (after the storage service's group-call secret or the calling zk secret
+  changed): delete `sfu.env`, `./sfu/make-sfu-env.sh`, `docker compose up -d --no-deps
+  calling-frontend`.
+- Reset of the calling data: `docker compose stop calling-frontend`, delete the table
+  (`aws dynamodb delete-table --table-name swarm_calling_rooms` against `http://dynamodb:8000`, e.g.
+  with `docker compose run --rm --no-deps --entrypoint aws calling-bootstrap ...`), then
+  `docker compose up --no-deps calling-bootstrap` and start the frontend. Every call link stops
+  working (the clients keep them and fail to join).
+- The table lives in the `dynamodb-data` volume, so the nightly snapshot (section 12) includes it.
+
+### Tested on 64.95.11.180, 2026-09-29
+
+- **From outside:** `HEAD`/`GET`/`PUT https://sfu.chat.swarm.green/v2/conference/participants` 401,
+  `GET /v1/call-link` 401, `/health` 404 at the edge; `GET /v2/calling/relays` without credentials
+  401 (it is a `GET`; `POST` 405); STUN on 3478 UDP and TCP; unauthenticated Allocate 401. After the
+  chat restart the websocket upgrade still 101, `/v2/groups` 401, `/v1/storage/manifest` 401 and a
+  CDN profile object 200.
+- **On the host:** `turn-credentials` 201 in Cloudflare's shape (ttl 86400; 10,000,000 capped at
+  172,800), 401 for a wrong or missing token (also from another container), 405 for `GET`, 400 for a
+  bad body; `turnutils_uclient` with a minted credential over UDP and over TCP: 40 of 40 messages
+  relayed to a public peer, none lost; denied peers 403; a wrong credential refused.
+- **One-to-one call** (A with *Always relay calls*, both microphones muted): A's log
+  `GET (WS) https://chat.swarm.green/v2/calling/relays 200 Success`, the three TURN URLs, three
+  local `typ relay` candidates on coturn ports; B showed *Incoming voice call* and answered;
+  A `ice_network_route_change(... local_relayed: true, local_relay_protocol: Udp ...)`,
+  `ice_connection_change(Connected)`, `RemoteAccepted`, both `ConnectedAndAccepted`, still
+  connected after 36 s, then hung up.
+- **Group call** (synthetic video, muted): both `PUT /v2/conference/participants 200 Success` and
+  `LocalDeviceState (Connected, Joined)`; the backend logged both clients joining one call and,
+  30 s later, both sending simulcast video (120/240/480 lines, about 80/200/510 kbps) and
+  receiving about 510 kbps; each saw the other's video; both left, the backend removed the call and
+  the frontend its record.
+- **Call link:** created (`POST /v1/call-link/create-auth?v101=true 200`, `PUT /v1/call-link 200`),
+  started by A, B read it and asked to join, A approved, B joined (2 people, video both ways),
+  deleted afterwards (`DELETE /v1/call-link 200`; a first attempt right after the call answered
+  409 because the call record still existed, see section 10).
+
+Not tested: real audio (both microphones stayed muted; RingRTC's native audio uses the PC's real
+devices, Chromium's fake-device switches do not reach it), clients on different networks and
+behind other NATs (both instances ran on one PC; one side was forced through the relay), mobile
+clients, `turns:` over TLS for networks that allow only 443, IPv6, more than two participants, load.
+
+---
+
 ## 6. Start order
 
 Compose enforces this with `depends_on` conditions, but know it for debugging:
@@ -700,7 +978,16 @@ registration-stub       (healthy: a CreateSession round trip over its own TLS)
 bigtable                (healthy: accepts connections on 8086)
   └─ bigtable-bootstrap (creates the 4 tables + column families if missing, exits 0)
        └─ storage       (healthy: GET :8080/_ready is 200, which reads each table once)
+coturn                  (host network; healthy: answers a STUN Binding request on 3478)
+turn-credentials        (healthy: GET :8080/healthz is 200)
+dynamodb
+  └─ calling-bootstrap  (creates swarm_calling_rooms + its TTL if missing, exits 0)
+calling-backend         (healthy: GET :8080/health is 200)
+  └─ calling-frontend   (after calling-bootstrap; healthy: GET :8080/health is 200)
 ```
+
+`chat` needs `turn-credentials` only when a client asks for relays, and Caddy reaches
+`calling-frontend` per request, so neither waits for the other.
 
 `chat` does not wait for `storage`: it calls it only when an account is deleted, and clients
 reach it through Caddy, which resolves `storage` per request.
@@ -767,6 +1054,10 @@ docker compose ps bigtable storage
 docker compose exec storage bash -c "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /_ready HTTP/1.0\r\n\r\n' >&3 && head -c 12 <&3"
 docker compose logs bigtable-bootstrap
 
+# calls (section 5d)
+docker compose ps coturn turn-credentials calling-backend calling-frontend
+curl -sI https://sfu.chat.swarm.green/v2/conference/participants | head -1   # 401
+
 # everything at a glance
 docker compose ps
 ```
@@ -822,7 +1113,7 @@ demonstrably boots a server with them (`./mvnw integration-test -Ptest-server`).
 | **FCM** | a service-account JSON that points at nothing | Android devices do not wake on new messages |
 | **Push in general** | consequence of the two above | **Desktop is unaffected**: it holds a websocket open and receives messages in real time. This is why desktop is phase 1 |
 | **GCP attachments (CDN2)** | `gcs.disabled.swarm.invalid`, throwaway RSA signing key | A CDN2 form would point at a name that does not resolve, so none is handed out: the dynamic-configuration experiment `cdn3` gives every account CDN3 (TUS) forms, served by the `tus` service. Avatars use CDN0, the `cdn` block (MinIO). Section 8a |
-| **Cloudflare TURN / calling** | `urls` names `sfu.chat.swarm.green`, which has no server; API endpoint is `turn.disabled.swarm.invalid` | Voice and video calling does not work. `urls` and `urlsWithIps` are `@NotEmpty` upstream, so they could not simply be emptied |
+| ~~Cloudflare TURN / calling~~ | **on since 2026-09-29**: the `turn.cloudflare` client talks to the stack's own `turn-credentials` service, coturn relays, Signal's calling service runs at `sfu.chat.swarm.green` (section 5d) | one-to-one and group calls and call links work; no `turns:` (TLS) relay yet |
 | **MobileCoin payments** | `paymentCurrencies: [MOB]` kept only because it is `@NotEmpty`; conversion API keys are `unset` | Upstream's payment feature is dead. Irrelevant: the SWARM wallet is on-device and does not use it |
 | **Spam filtering, registration fraud checks, captcha** | the private `spam-filter` submodule is not part of this fork | Upstream's no-op implementations apply. **Captcha accepts the token `noop.noop.registration.noop`** — that is what makes manual registration possible, and it is also why this stack must never be exposed as a real service |
 | **OpenTelemetry** | `enabled: false` | No traces. Turn it on and point `url` at a collector if you want them |
@@ -1108,6 +1399,9 @@ Not covered, or not working:
 | Attachments and avatars | Docker volume `minio-data` | `mc mirror` to another location |
 | Unfinished attachment uploads | Docker volume `tus-data` | not worth backing up: clients retry a failed send with a new upload form |
 | Groups, group change logs, settings/contacts sync records | Docker volume `bigtable-data` (LevelDB files of the Bigtable emulator) | in the nightly snapshot (section 12): stop `bigtable` for a second and tar the volume. Losing it breaks every existing group (section 5c, "Reset") |
+| `deploy/staging/turn.env` | host filesystem, mode 600 | back up, or recreate with `coturn/make-turn-env.sh` (section 5d, rotation): clients fetch new relay credentials by themselves |
+| `deploy/staging/sfu.env` | host filesystem, mode 600 | recreate with `sfu/make-sfu-env.sh`: both values are copies of secrets in `storage.env` and `staging-secrets.yml` |
+| Active group calls and call links | DynamoDB table `swarm_calling_rooms` in the `dynamodb-data` volume | part of the DynamoDB copy in the nightly snapshot. Losing it ends calls in progress and every call link |
 
 Nothing here is a supported disaster-recovery story. It is a staging stack: assume you can
 lose it and re-register the test accounts.
@@ -1137,6 +1431,14 @@ lose it and re-register the test accounts.
 | `storage` unhealthy, its log shows `NOT_FOUND` for a `swarm_storage_*` table | the tables were never created in this emulator volume | `docker compose up bigtable-bootstrap` and read its output, then `docker compose restart storage` |
 | Desktop: a new account's first `GET /v1/storage/manifest` answers 404, log `sync(0): missing` | nothing stored for it yet | expected; the app writes the first manifest right after (`PUT /v1/storage/ 200`) |
 | A group photo does not show for the other members; their log has `GET (REST) https://cdn.chat.swarm.green/[REDACTED]...` with 403 or 404 | 403 with `Server: MinIO`: the bucket's anonymous policy lacks `groups/*` (an older `minio/bootstrap-buckets.sh` ran); 404 with `Server: Caddy`: the running Caddy config lacks `/groups/*` in the `cdn.` block's `@read` | `docker compose up --no-deps minio-bootstrap`, check `mc anonymous get-json local/swarm-cdn`; or validate and `caddy reload`. Section 5c, "Group photos" |
+| Calls: `GET /v2/calling/relays` answers 500 in a client log; the chat log has `failure request credentials from Cloudflare Turn (code=401)` | `turn.cloudflare.apiToken` in `staging-secrets.yml` differs from `SWARM_TURN_API_TOKEN` in `turn.env`, or the chat server was not restarted after the token changed | make them equal (section 5d, rotation), `docker compose restart chat` |
+| Calls: relays arrive but a relayed call never connects; `turnutils_uclient` gets `401` | `SWARM_TURN_STATIC_AUTH_SECRET` of `coturn` and `turn-credentials` differ (one was not recreated after `turn.env` changed) | `docker compose up -d --no-deps --force-recreate coturn turn-credentials` |
+| Calls: every relayed call fails; `turnutils_uclient` to a public peer ends in `channel bind: error 403`; coturn logs `denied in the range: ::-::1` | an IPv6 `denied-peer-ip` range starting at `::` matches every IPv4 peer (section 5d, Security) | remove it from `coturn/turnserver.conf`, `docker compose restart coturn` |
+| Calls: coturn restarts in a loop with `cannot create /var/lib/coturn/turnserver.conf: Permission denied` | the tmpfs is not owned by the image's user | keep `uid=65534,gid=65534,mode=700` on the `tmpfs` line of `coturn` in `docker-compose.yml` |
+| Group call: `GET https://sfu.chat.swarm.green/v2/conference/participants` answers 401/403 in a client log although `GET /v2/groups/token` was 200 | `CALLING_AUTH_KEY` in `sfu.env` is not the storage service's `SWARM_STORAGE_GROUP_CALL_SECRET_HEX` | delete `sfu.env`, `./sfu/make-sfu-env.sh`, `docker compose up -d --no-deps calling-frontend` |
+| Group call: joins (`PUT ... 200`) but never connects | UDP and TCP 10000 do not reach `calling-backend` (firewall, or `--ice-candidate-ip` is not the public address) | `ufw status`, `docker compose ps calling-backend`, check the published ports |
+| `calling-frontend` exits at start with a zkgroup or base64 error, or `the following required arguments were not provided` | `sfu.env` is missing or `CALLING_ZKPARAMS` is not `callingZkConfigV101.serverSecret` | `./sfu/make-sfu-env.sh`, then start it again |
+| Deleting a call link fails with 409 | the link's call record still exists: the backend removes an empty call about 30 s after the last client left | try again a minute later |
 | An attachment spins forever; the client log shows a POST to `gcs.disabled.swarm.invalid` | the account got a CDN2 form: the `cdn3` experiment is missing from `s3://swarm-config/dynamic-config.yaml` | `docker compose up minio-bootstrap` (re-uploads `minio/dynamic-config.yaml`); the server re-reads it within 30 s |
 | `tus` answers 401 to every upload | `SWARM_TUS_TOKEN_SECRET` in `tus.env` is not `tus.userAuthenticationTokenSharedSecret` | fix `tus.env`, `docker compose up -d --no-deps tus` |
 | `tus` is unhealthy, `/healthz` says `S3 HEAD answered 403` | its MinIO user or policy is missing | `docker compose up minio-bootstrap`, then wait a minute (it re-probes) |
@@ -1167,6 +1469,9 @@ docker compose logs foundationdb-init dynamodb-bootstrap minio-bootstrap
 - [ ] `health.delayedShutdownHandlerEnabled: true`.
 - [ ] Off-host backups of `staging-secrets.yml`, `certs/` and the data volumes.
 - [ ] A decision on PIN recovery: SVR needs SGX hardware, which a normal VPS does not have.
+- [ ] Calls: a `turns:` (TLS) relay on 443 for networks that allow nothing else, more relay ports
+      and a second coturn/backend for capacity, IPv6, and a real DynamoDB for the calling service's
+      table.
 
 ## 12. Nightly snapshot of the data (since 2026-09-28)
 
